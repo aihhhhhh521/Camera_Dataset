@@ -1,0 +1,8 @@
+requests
+tqdm
+PyYAML
+pillow
+numpy
+opencv-python
+exifread
+imagehash

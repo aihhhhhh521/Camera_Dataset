@@ -1,0 +1,71 @@
+dataset_root: "../"   # 指向 My_CameraPose_Dataset 根目录（scripts 的上一级）
+
+naming:
+  prefixes:
+    openverse: "OPV"
+    flickr: "FLK"
+  digits: 5            # OPV_00001 这种位数
+
+download:
+  timeout_sec: 30
+  max_retries: 3
+  sleep_sec: 0.2       # 礼貌爬取（每次请求间隔）
+  user_agent: "CameraPoseDatasetBot/1.0 (research; CC-only)"
+
+licenses:
+  mode: "cc0_only"     # 先建议 cc0_only；后续你要扩大可以改为 allowlist
+  allowlist_openverse: ["cc0"]   # openverse license 参数（cc0/by/by-sa/by-nc/by-nc-sa...）
+  # Flickr 侧我们会动态拉取 license_id 映射，再按“是否 ND”过滤，cc0_only 会只保留 Public Domain/CC0
+
+categories:
+  portraits:
+    keywords: ["portrait", "people", "headshot", "lifestyle"]
+    target_count: 500
+  animals_plants:
+    keywords: ["wildlife", "bird", "flower", "plant"]
+    target_count: 500
+  natural_landscapes:
+    keywords: ["landscape", "mountain", "ocean", "sunset"]
+    target_count: 500
+  urban_architecture:
+    keywords: ["architecture", "city", "street", "building"]
+    target_count: 500
+  food_still_life:
+    keywords: ["food", "coffee", "dessert", "still life"]
+    target_count: 500
+  sports_events:
+    keywords: ["sports", "marathon", "basketball", "festival"]
+    target_count: 500
+
+openverse:
+  base_url: "https://api.openverse.org/v1"
+  # 可选：有就填，没有就留空（匿名跑）
+  client_id: ""
+  client_secret: ""
+  sources: []          # 为空=不限定来源；你也可以填 ["wordpress", "flickr"] 等
+
+flickr:
+  api_key: ""          # 必填
+  per_page: 250
+  sort: "relevance"
+  safe_search: 1       # 1=安全；2=中等；3=限制
+  content_type: 1      # photos only
+
+pipeline_filter:
+  enabled: true
+  min_side: 1024
+  max_aspect_ratio: 3.0
+  min_filesize_kb: 40
+
+  # 清晰度：Laplacian 方差阈值（经验值，越大越清晰）
+  min_laplacian_var: 80.0
+
+  # 构图显著性（轻量 saliency）：显著区域占比不能太小/太大（你的图里写 10%~80%）
+  saliency_enabled: true
+  saliency_min_ratio: 0.10
+  saliency_max_ratio: 0.80
+
+  # 可选：深度一致性（需要安装 torch/transformers 且首次会下载模型）
+  depth_enabled: false
+  depth_model: "depth-anything/Depth-Anything-V2-Small-hf"
+  depth_min_grad_var: 0.002   # 深度梯度方差太低=很平（可能不可重建）；太高=碎片化（可在代码里加上上限）
