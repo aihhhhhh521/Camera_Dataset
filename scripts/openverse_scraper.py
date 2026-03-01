@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import time
 import requests
 from typing import Dict, Any, List, Optional
@@ -19,6 +20,11 @@ def load_cfg() -> dict:
     dataset_root = Path(cfg.get("dataset_root", "."))
     if not dataset_root.is_absolute():
         cfg["dataset_root"] = str((cfg_path.parent / dataset_root).resolve())
+
+    # 允许通过环境变量覆盖 Openverse 凭据，避免把密钥写入配置文件。
+    ov_cfg = cfg.setdefault("openverse", {})
+    ov_cfg["client_id"] = os.getenv("OPENVERSE_CLIENT_ID", ov_cfg.get("client_id", ""))
+    ov_cfg["client_secret"] = os.getenv("OPENVERSE_CLIENT_SECRET", ov_cfg.get("client_secret", ""))
     return cfg
 
 def get_token(base_url: str, client_id: str, client_secret: str, ua: str) -> Optional[str]:
@@ -70,6 +76,64 @@ def ov_search(
     r = requests.get(url, params=params, headers=headers, timeout=30)
     r.raise_for_status()
     return r.json()
+
+def ov_search_with_retry(
+    base_url: str,
+    q: str,
+    page: int,
+    page_size: int,
+    license_list: List[str],
+    sources: List[str],
+    token: Optional[str],
+    ua: str,
+    client_id: str,
+    client_secret: str,
+) -> tuple[Dict[str, Any], Optional[str]]:
+    """
+    对 Openverse 查询做一次 401 自动恢复：
+    - 若已有 token：自动刷新 token 后重试。
+    - 若无 token 且无凭据：抛出带操作建议的错误信息。
+    """
+    try:
+        return ov_search(
+            base_url=base_url,
+            q=q,
+            page=page,
+            page_size=page_size,
+            license_list=license_list,
+            sources=sources,
+            token=token,
+            ua=ua,
+        ), token
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else None
+        if status != 401:
+            raise
+
+        if token or (client_id and client_secret):
+            new_token = get_token(base_url, client_id, client_secret, ua)
+            if not new_token:
+                raise RuntimeError(
+                    "Openverse 返回 401，且 token 刷新失败。请检查 openverse.client_id / client_secret 是否有效。"
+                ) from e
+            data = ov_search(
+                base_url=base_url,
+                q=q,
+                page=page,
+                page_size=page_size,
+                license_list=license_list,
+                sources=sources,
+                token=new_token,
+                ua=ua,
+            )
+            return data, new_token
+
+        raise RuntimeError(
+            "Openverse API 返回 401 Unauthorized。请在 scripts/config.yaml 的 openverse.client_id "
+            "和 openverse.client_secret 中填入凭据，或设置环境变量 OPENVERSE_CLIENT_ID / "
+            "OPENVERSE_CLIENT_SECRET。"
+        ) from e
+
 
 def download(url: str, ua: str, timeout: int, max_retries: int) -> bytes:
     last_err = None
@@ -134,6 +198,8 @@ def main():
         license_list = cfg["licenses"].get("allowlist_openverse", ["cc0"])
 
     token = get_token(base_url, ov_cfg.get("client_id", ""), ov_cfg.get("client_secret", ""), ua)
+    client_id = ov_cfg.get("client_id", "")
+    client_secret = ov_cfg.get("client_secret", "")
     sources = ov_cfg.get("sources", []) or []
 
     for cat, spec in cfg["categories"].items():
@@ -150,7 +216,7 @@ def main():
 
             with tqdm(total=target, initial=saved, desc=f"OV {cat}:{kw}", unit="img") as pbar:
                 while saved < target:
-                    data = ov_search(
+                    data, token = ov_search_with_retry(
                         base_url=base_url,
                         q=kw,
                         page=page,
@@ -159,6 +225,8 @@ def main():
                         sources=sources,
                         token=token,
                         ua=ua,
+                        client_id=client_id,
+                        client_secret=client_secret,
                     )
                     results = data.get("results", [])
                     if not results:
