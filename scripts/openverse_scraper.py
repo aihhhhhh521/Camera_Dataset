@@ -32,19 +32,50 @@ def get_token(base_url: str, client_id: str, client_secret: str, ua: str) -> Opt
     Openverse 官方 JS client 支持 clientId/clientSecret 自动换 token。:contentReference[oaicite:8]{index=8}
     这里提供一个“可选”token获取：你没有凭据就返回 None（匿名跑）。
     """
+    client_id = (client_id or "").strip()
+    client_secret = (client_secret or "").strip()
     if not client_id or not client_secret:
         return None
+
     token_url = base_url.rstrip("/") + "/auth_tokens/token/"
-    data = {
-        "grant_type": "client_credentials",
-        "client_id": client_id,
-        "client_secret": client_secret,
-    }
-    r = requests.post(token_url, data=data, headers={"User-Agent": ua}, timeout=30)
-    if r.status_code != 200:
-        print(f"[WARN] Openverse token failed: {r.status_code} {r.text[:200]}")
-        return None
-    return r.json().get("access_token")
+    headers = {"User-Agent": ua}
+
+    # 兼容不同 OAuth 服务端实现：优先标准 OAuth2 form，再尝试 Basic Auth 方案。
+    attempts = [
+        {
+            "name": "oauth2_form",
+            "kwargs": {
+                "data": {
+                    "grant_type": "client_credentials",
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                }
+            },
+        },
+        {
+            "name": "oauth2_basic_auth",
+            "kwargs": {
+                "data": {"grant_type": "client_credentials"},
+                "auth": (client_id, client_secret),
+            },
+        },
+    ]
+
+    for idx, attempt in enumerate(attempts, start=1):
+        r = requests.post(token_url, headers=headers, timeout=30, **attempt["kwargs"])
+        if r.status_code != 200:
+            print(
+                f"[WARN] Openverse token attempt#{idx} ({attempt['name']}) failed: "
+                f"{r.status_code} {r.text[:200]}"
+            )
+            continue
+
+        token = (r.json().get("access_token") or "").strip()
+        if token:
+            return token
+        print(f"[WARN] Openverse token attempt#{idx} succeeded but access_token is empty")
+
+    return None
 
 def ov_search(
     base_url: str,
@@ -116,17 +147,27 @@ def ov_search_with_retry(
                 raise RuntimeError(
                     "Openverse 返回 401，且 token 刷新失败。请检查 openverse.client_id / client_secret 是否有效。"
                 ) from e
-            data = ov_search(
-                base_url=base_url,
-                q=q,
-                page=page,
-                page_size=page_size,
-                license_list=license_list,
-                sources=sources,
-                token=new_token,
-                ua=ua,
-            )
-            return data, new_token
+            try:
+                data = ov_search(
+                    base_url=base_url,
+                    q=q,
+                    page=page,
+                    page_size=page_size,
+                    license_list=license_list,
+                    sources=sources,
+                    token=new_token,
+                    ua=ua,
+                )
+                return data, new_token
+            except requests.HTTPError as e2:
+                status2 = e2.response.status_code if e2.response is not None else None
+                if status2 == 401:
+                    raise RuntimeError(
+                        "Openverse token 获取成功但访问 /images/ 仍返回 401。"
+                        "这通常表示 client_id/client_secret 对应应用未获得该 API 访问权限，"
+                        "或当前凭据已失效（请在 Openverse 控制台重置并重新申请权限）。"
+                    ) from e2
+                raise
 
         raise RuntimeError(
             "Openverse API 返回 401 Unauthorized。请在 scripts/config.yaml 的 openverse.client_id "
