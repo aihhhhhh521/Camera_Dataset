@@ -1,6 +1,5 @@
 from __future__ import annotations
 import time
-import json
 import requests
 from typing import Dict, Any, List, Optional
 from pathlib import Path
@@ -13,8 +12,14 @@ from pipeline_filter import PipelineFilter, sha256_bytes, exif_extract
 from hash_db import init_db, has_sha256, add_sha256
 
 def load_cfg() -> dict:
-    with open("config.yaml", "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    cfg_path = Path(__file__).with_name("config.yaml")
+    with cfg_path.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    dataset_root = Path(cfg.get("dataset_root", "."))
+    if not dataset_root.is_absolute():
+        cfg["dataset_root"] = str((cfg_path.parent / dataset_root).resolve())
+    return cfg
 
 def get_token(base_url: str, client_id: str, client_secret: str, ua: str) -> Optional[str]:
     """
