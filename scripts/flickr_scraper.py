@@ -1,8 +1,9 @@
 from __future__ import annotations
+import json
 import time
 import requests
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import yaml
 from tqdm import tqdm
@@ -12,6 +13,44 @@ from pipeline_filter import PipelineFilter, sha256_bytes, exif_extract
 from hash_db import init_db, has_sha256, add_sha256
 
 FLICKR_REST = "https://api.flickr.com/services/rest/"
+
+
+def _error_type(exc: Exception) -> str:
+    if isinstance(exc, requests.Timeout):
+        return "requests.Timeout"
+    if isinstance(exc, requests.HTTPError):
+        return "requests.HTTPError"
+    return type(exc).__name__
+
+
+def log_failure(
+    *,
+    photo_id: str,
+    url: str,
+    kw: str,
+    page: int,
+    error_type: str,
+    message: str,
+    log_path: Optional[Path] = None,
+) -> None:
+    payload: Dict[str, Any] = {
+        "photo_id": photo_id,
+        "url": url,
+        "kw": kw,
+        "page": page,
+        "error_type": error_type,
+        "message": message,
+        "ts": int(time.time()),
+    }
+    print(
+        "[Flickr][warn] "
+        f"photo_id={photo_id} kw={kw} page={page} error_type={error_type} "
+        f"url={url} msg={message}"
+    )
+    if log_path:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 def load_cfg() -> dict:
     cfg_path = Path(__file__).with_name("config.yaml")
@@ -106,7 +145,7 @@ def get_sizes_best(api_key: str, photo_id: str, ua: str) -> Optional[str]:
             if area > best_area:
                 best_area = area
                 best = s.get("source")
-        except Exception:
+        except (TypeError, ValueError, KeyError):
             continue
     return best
 
@@ -117,10 +156,18 @@ def download(url: str, ua: str, timeout: int, max_retries: int) -> bytes:
             r = requests.get(url, headers={"User-Agent": ua}, timeout=timeout)
             r.raise_for_status()
             return r.content
-        except Exception as e:
+        except requests.Timeout as e:
             last_err = e
             time.sleep(0.5)
-    raise RuntimeError(f"download failed: {url} err={last_err}")
+        except requests.HTTPError as e:
+            last_err = e
+            time.sleep(0.5)
+        except requests.RequestException as e:
+            last_err = e
+            time.sleep(0.5)
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError(f"download failed: {url} err=unknown")
 
 def build_metadata(
     image_id: str,
@@ -163,6 +210,10 @@ def main():
     digits = int(cfg["naming"]["digits"])
 
     fcfg = cfg["flickr"]
+    fail_log_path = Path("logs/flickr_failures.jsonl")
+    breaker_threshold = int(fcfg.get("consecutive_fail_threshold", 8))
+    breaker_sleep_sec = float(fcfg.get("consecutive_fail_sleep_sec", 5))
+    consecutive_download_failures = 0
     api_key = fcfg.get("api_key", "").strip()
     if not api_key:
         raise RuntimeError("Flickr api_key is empty. Fill scripts/config.yaml -> flickr.api_key")
@@ -233,11 +284,46 @@ def main():
                         if not url:
                             # 兜底：getSizes 再查一次最大图
                             time.sleep(cfg["download"]["sleep_sec"])
-                            url = get_sizes_best(api_key, photo_id, ua)
+                            try:
+                                url = get_sizes_best(api_key, photo_id, ua)
+                            except requests.Timeout as e:
+                                log_failure(
+                                    photo_id=photo_id,
+                                    url="",
+                                    kw=kw,
+                                    page=page,
+                                    error_type=_error_type(e),
+                                    message=str(e),
+                                    log_path=fail_log_path,
+                                )
+                                continue
+                            except requests.HTTPError as e:
+                                log_failure(
+                                    photo_id=photo_id,
+                                    url="",
+                                    kw=kw,
+                                    page=page,
+                                    error_type=_error_type(e),
+                                    message=str(e),
+                                    log_path=fail_log_path,
+                                )
+                                continue
+                            except Exception as e:
+                                log_failure(
+                                    photo_id=photo_id,
+                                    url="",
+                                    kw=kw,
+                                    page=page,
+                                    error_type=_error_type(e),
+                                    message=str(e),
+                                    log_path=fail_log_path,
+                                )
+                                continue
                         if not url:
                             continue
 
                         time.sleep(cfg["download"]["sleep_sec"])
+                        b = None
                         try:
                             b = download(
                                 url,
@@ -245,14 +331,93 @@ def main():
                                 timeout=int(cfg["download"]["timeout_sec"]),
                                 max_retries=int(cfg["download"]["max_retries"]),
                             )
-                        except Exception:
+                        except requests.Timeout as e:
+                            consecutive_download_failures += 1
+                            log_failure(
+                                photo_id=photo_id,
+                                url=url,
+                                kw=kw,
+                                page=page,
+                                error_type=_error_type(e),
+                                message=str(e),
+                                log_path=fail_log_path,
+                            )
+                        except requests.HTTPError as e:
+                            consecutive_download_failures += 1
+                            log_failure(
+                                photo_id=photo_id,
+                                url=url,
+                                kw=kw,
+                                page=page,
+                                error_type=_error_type(e),
+                                message=str(e),
+                                log_path=fail_log_path,
+                            )
+                        except Exception as e:
+                            consecutive_download_failures += 1
+                            log_failure(
+                                photo_id=photo_id,
+                                url=url,
+                                kw=kw,
+                                page=page,
+                                error_type=_error_type(e),
+                                message=str(e),
+                                log_path=fail_log_path,
+                            )
+                        else:
+                            consecutive_download_failures = 0
+
+                        if consecutive_download_failures >= breaker_threshold:
+                            print(
+                                "[Flickr][breaker] "
+                                f"consecutive_download_failures={consecutive_download_failures} "
+                                f"sleep={breaker_sleep_sec}s"
+                            )
+                            time.sleep(breaker_sleep_sec)
+                            consecutive_download_failures = 0
+
+                        if b is None:
                             continue
 
+                        try:
+                            ok, metrics, reason = pf.validate(b)
+                        except requests.Timeout as e:
+                            log_failure(
+                                photo_id=photo_id,
+                                url=url,
+                                kw=kw,
+                                page=page,
+                                error_type=_error_type(e),
+                                message=str(e),
+                                log_path=fail_log_path,
+                            )
+                            continue
+                        except requests.HTTPError as e:
+                            log_failure(
+                                photo_id=photo_id,
+                                url=url,
+                                kw=kw,
+                                page=page,
+                                error_type=_error_type(e),
+                                message=str(e),
+                                log_path=fail_log_path,
+                            )
+                            continue
+                        except Exception as e:
+                            log_failure(
+                                photo_id=photo_id,
+                                url=url,
+                                kw=kw,
+                                page=page,
+                                error_type=_error_type(e),
+                                message=str(e),
+                                log_path=fail_log_path,
+                            )
+                            continue
                         s256 = sha256_bytes(b)
                         if has_sha256(dataset_root, s256):
                             continue
 
-                        ok, metrics, reason = pf.validate(b)
                         if not ok:
                             continue
 
