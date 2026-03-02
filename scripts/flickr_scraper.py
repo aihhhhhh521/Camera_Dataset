@@ -15,6 +15,32 @@ from hash_db import init_db, has_sha256, add_sha256
 FLICKR_REST = "https://api.flickr.com/services/rest/"
 
 
+def build_api_headers(user_agent: str) -> Dict[str, str]:
+    return {"User-Agent": user_agent}
+
+
+def build_download_headers(
+        *,
+        user_agent: str,
+        headers_profile: str,
+        referer: Optional[str] = None,
+        referer_enabled: bool = True,
+) -> Dict[str, str]:
+    profiles: Dict[str, Dict[str, str]] = {
+        "minimal": {},
+        "browser_like": {
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "keep-alive",
+        },
+    }
+    profile_headers = profiles.get(headers_profile, profiles["browser_like"]).copy()
+    profile_headers["User-Agent"] = user_agent
+    if referer_enabled and referer:
+        profile_headers["Referer"] = referer
+    return profile_headers
+
+
 def _error_type(exc: Exception) -> str:
     if isinstance(exc, requests.Timeout):
         return "requests.Timeout"
@@ -24,14 +50,14 @@ def _error_type(exc: Exception) -> str:
 
 
 def log_failure(
-    *,
-    photo_id: str,
-    url: str,
-    kw: str,
-    page: int,
-    error_type: str,
-    message: str,
-    log_path: Optional[Path] = None,
+        *,
+        photo_id: str,
+        url: str,
+        kw: str,
+        page: int,
+        error_type: str,
+        message: str,
+        log_path: Optional[Path] = None,
 ) -> None:
     payload: Dict[str, Any] = {
         "photo_id": photo_id,
@@ -52,6 +78,7 @@ def log_failure(
         with log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
+
 def load_cfg() -> dict:
     cfg_path = Path(__file__).with_name("config.yaml")
     with cfg_path.open("r", encoding="utf-8") as f:
@@ -62,6 +89,7 @@ def load_cfg() -> dict:
         cfg["dataset_root"] = str((cfg_path.parent / dataset_root).resolve())
     return cfg
 
+
 def flickr_call(api_key: str, method: str, params: dict, ua: str) -> dict:
     base = {
         "method": method,
@@ -70,12 +98,13 @@ def flickr_call(api_key: str, method: str, params: dict, ua: str) -> dict:
         "nojsoncallback": 1,
     }
     base.update(params)
-    r = requests.get(FLICKR_REST, params=base, headers={"User-Agent": ua}, timeout=30)
+    r = requests.get(FLICKR_REST, params=base, headers=build_api_headers(ua), timeout=30)
     r.raise_for_status()
     data = r.json()
     if data.get("stat") != "ok":
         raise RuntimeError(f"Flickr API error: {data}")
     return data
+
 
 def get_license_map(api_key: str, ua: str) -> Dict[str, dict]:
     data = flickr_call(api_key, "flickr.photos.licenses.getInfo", {}, ua)
@@ -85,10 +114,12 @@ def get_license_map(api_key: str, ua: str) -> Dict[str, dict]:
         m[it["id"]] = it
     return m
 
+
 def is_nd_license(name: str) -> bool:
     # Flickr license name 一般会包含 "NoDerivs" 字样
     n = name.lower()
     return ("noderiv" in n) or ("no deriv" in n) or ("nd" in n and "cc" in n)
+
 
 def choose_allowed_license_ids(license_map: Dict[str, dict], mode: str) -> List[str]:
     """
@@ -124,12 +155,14 @@ def choose_allowed_license_ids(license_map: Dict[str, dict], mode: str) -> List[
 
     return ids
 
+
 def best_download_url(photo: dict) -> Optional[str]:
     # extras 里如果有 url_o（原图）就用，否则降级
     for k in ["url_o", "url_l", "url_c", "url_z"]:
         if k in photo:
             return photo[k]
     return None
+
 
 def get_sizes_best(api_key: str, photo_id: str, ua: str) -> Optional[str]:
     data = flickr_call(api_key, "flickr.photos.getSizes", {"photo_id": photo_id}, ua)
@@ -149,11 +182,12 @@ def get_sizes_best(api_key: str, photo_id: str, ua: str) -> Optional[str]:
             continue
     return best
 
-def download(url: str, ua: str, timeout: int, max_retries: int) -> bytes:
+
+def download(url: str, headers: Dict[str, str], timeout: int, max_retries: int) -> bytes:
     last_err = None
     for _ in range(max_retries):
         try:
-            r = requests.get(url, headers={"User-Agent": ua}, timeout=timeout)
+            r = requests.get(url, headers=headers, timeout=timeout)
             r.raise_for_status()
             return r.content
         except requests.Timeout as e:
@@ -169,18 +203,19 @@ def download(url: str, ua: str, timeout: int, max_retries: int) -> bytes:
         raise last_err
     raise RuntimeError(f"download failed: {url} err=unknown")
 
+
 def build_metadata(
-    image_id: str,
-    category: str,
-    original_url: str,
-    photo_page_url: str,
-    author: str,
-    license_type: str,
-    license_url: str,
-    search_keyword: str,
-    resolution_hw: tuple[int, int],
-    exif_data: dict,
-    pipeline_metrics: dict,
+        image_id: str,
+        category: str,
+        original_url: str,
+        photo_page_url: str,
+        author: str,
+        license_type: str,
+        license_url: str,
+        search_keyword: str,
+        resolution_hw: tuple[int, int],
+        exif_data: dict,
+        pipeline_metrics: dict,
 ) -> dict:
     return {
         "image_id": image_id,
@@ -197,6 +232,7 @@ def build_metadata(
         "pipeline_metrics": pipeline_metrics,
     }
 
+
 def main():
     cfg = load_cfg()
     dataset_root = cfg["dataset_root"]
@@ -204,6 +240,8 @@ def main():
     init_db(dataset_root)
 
     ua = cfg["download"]["user_agent"]
+    headers_profile = cfg["download"].get("headers_profile", "browser_like")
+    referer_enabled = bool(cfg["download"].get("referer_enabled", True))
     pf = PipelineFilter(cfg["pipeline_filter"])
 
     prefixes = cfg["naming"]["prefixes"]
@@ -247,7 +285,8 @@ def main():
                         "safe_search": int(fcfg.get("safe_search", 1)),
                         "content_type": int(fcfg.get("content_type", 1)),
                         "media": "photos",
-                        "license": ",".join(map(str, allowed_license_ids)),  # flickr.photos.search 支持多个 license id :contentReference[oaicite:12]{index=12}
+                        "license": ",".join(map(str, allowed_license_ids)),
+                        # flickr.photos.search 支持多个 license id :contentReference[oaicite:12]{index=12}
                         "extras": ",".join([
                             "license",
                             "owner_name",
@@ -281,6 +320,8 @@ def main():
 
                         # 下载 URL
                         url = best_download_url(ph)
+                        owner = ph.get("owner", "")
+                        photo_page = f"https://www.flickr.com/photos/{owner}/{photo_id}/"
                         if not url:
                             # 兜底：getSizes 再查一次最大图
                             time.sleep(cfg["download"]["sleep_sec"])
@@ -327,7 +368,12 @@ def main():
                         try:
                             b = download(
                                 url,
-                                ua=ua,
+                                headers=build_download_headers(
+                                    user_agent=ua,
+                                    headers_profile=headers_profile,
+                                    referer=photo_page,
+                                    referer_enabled=referer_enabled,
+                                ),
                                 timeout=int(cfg["download"]["timeout_sec"]),
                                 max_retries=int(cfg["download"]["max_retries"]),
                             )
@@ -424,10 +470,6 @@ def main():
                         image_id = next_id(dataset_root, prefixes["flickr"], digits)
                         exif_data = exif_extract(b)
 
-                        # Flickr 照片页
-                        owner = ph.get("owner", "")
-                        photo_page = f"https://www.flickr.com/photos/{owner}/{photo_id}/"
-
                         h = int(metrics.get("H", 0))
                         w = int(metrics.get("W", 0))
 
@@ -454,6 +496,7 @@ def main():
                     page += 1
 
     print("\n[Flickr] done.")
+
 
 if __name__ == "__main__":
     main()

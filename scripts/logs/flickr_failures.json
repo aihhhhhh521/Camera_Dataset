@@ -223,5 +223,140 @@
     "error_type": "requests.HTTPError",
     "message": "429 Client Error: Too Many Requests for url: https://live.staticflickr.com/888/42907531272_1cd4f30995_o.jpg",
     "ts": 1772435419
+  },
+  {
+    "photo_id": "2258913498",
+    "url": "https://live.staticflickr.com/2014/2258913498_1e9bea2632_o.jpg",
+    "kw": "portrait",
+    "page": 1,
+    "error_type": "requests.HTTPError",
+    "message": "429 Client Error: Too Many Requests for url: https://live.staticflickr.com/2014/2258913498_1e9bea2632_o.jpg",
+    "ts": 1772436406
+  },
+  {
+    "photo_id": "27940944441",
+    "url": "https://live.staticflickr.com/7311/27940944441_06e3dccee5_o.jpg",
+    "kw": "portrait",
+    "page": 1,
+    "error_type": "requests.HTTPError",
+    "message": "429 Client Error: Too Many Requests for url: https://live.staticflickr.com/7311/27940944441_06e3dccee5_o.jpg",
+    "ts": 1772436415
+  },
+  {
+    "photo_id": "16101268440",
+    "url": "https://live.staticflickr.com/8600/16101268440_facf6c2d5e_o.jpg",
+    "kw": "portrait",
+    "page": 1,
+    "error_type": "requests.HTTPError",
+    "message": "429 Client Error: Too Many Requests for url: https://live.staticflickr.com/8600/16101268440_facf6c2d5e_o.jpg",
+    "ts": 1772436424
+  },
+  {
+    "photo_id": "6038123597",
+    "url": "https://live.staticflickr.com/6124/6038123597_be0d40932e_o.jpg",
+    "kw": "portrait",
+    "page": 1,
+    "error_type": "requests.HTTPError",
+    "message": "429 Client Error: Too Many Requests for url: https://live.staticflickr.com/6124/6038123597_be0d40932e_o.jpg",
+    "ts": 1772436433
+  },
+  {
+    "photo_id": "9711045237",
+    "url": "https://live.staticflickr.com/7379/9711045237_dc48856ee7_o.jpg",
+    "kw": "portrait",
+    "page": 1,
+    "error_type": "requests.HTTPError",
+    "message": "429 Client Error: Too Many Requests for url: https://live.staticflickr.com/7379/9711045237_dc48856ee7_o.jpg",
+    "ts": 1772436442
+  },
+  {
+    "photo_id": "2258913498",
+    "url": "https://live.staticflickr.com/2014/2258913498_1e9bea2632_o.jpg",
+    "kw": "portrait",
+    "page": 1,
+    "error_type": "requests.HTTPError",
+    "message": "429 Client Error: Too Many Requests for url: https://live.staticflickr.com/2014/2258913498_1e9bea2632_o.jpg",
+    "ts": 1772436912
+  },
+  {
+    "photo_id": "27940944441",
+    "url": "https://live.staticflickr.com/7311/27940944441_06e3dccee5_o.jpg",
+    "kw": "portrait",
+    "page": 1,
+    "error_type": "requests.HTTPError",
+    "message": "429 Client Error: Too Many Requests for url: https://live.staticflickr.com/7311/27940944441_06e3dccee5_o.jpg",
+    "ts": 1772436917
+  },
+  {
+    "photo_id": "16101268440",
+    "url": "https://live.staticflickr.com/8600/16101268440_facf6c2d5e_o.jpg",
+    "kw": "portrait",
+    "page": 1,
+    "error_type": "requests.HTTPError",
+    "message": "429 Client Error: Too Many Requests for url: https://live.staticflickr.com/8600/16101268440_facf6c2d5e_o.jpg",
+    "ts": 1772436922
+  },
+  {
+    "photo_id": "6038123597",
+    "url": "https://live.staticflickr.com/6124/6038123597_be0d40932e_o.jpg",
+    "kw": "portrait",
+    "page": 1,
+    "error_type": "requests.HTTPError",
+    "message": "429 Client Error: Too Many Requests for url: https://live.staticflickr.com/6124/6038123597_be0d40932e_o.jpg",
+    "ts": 1772436926
+  },
+  {
+    "photo_id": "9711045237",
+    "url": "https://live.staticflickr.com/7379/9711045237_dc48856ee7_o.jpg",
+    "kw": "portrait",
+    "page": 1,
+    "error_type": "requests.HTTPError",
+    "message": "429 Client Error: Too Many Requests for url: https://live.staticflickr.com/7379/9711045237_dc48856ee7_o.jpg",
+    "ts": 1772436931
+  },
+  {
+    "photo_id": "5064062887",
+    "url": "https://live.staticflickr.com/4088/5064062887_65bec12a82_o.jpg",
+    "kw": "portrait",
+    "page": 1,
+    "error_type": "requests.HTTPError",
+    "message": "429 Client Error: Too Many Requests for url: https://live.staticflickr.com/4088/5064062887_65bec12a82_o.jpg",
+    "ts": 1772436935
+  },
+  {
+    "photo_id": "23257755594",
+    "url": "https://live.staticflickr.com/5696/23257755594_b0bbbb490e_o.jpg",
+    "kw": "portrait",
+    "page": 1,
+    "error_type": "requests.HTTPError",
+    "message": "429 Client Error: Too Many Requests for url: https://live.staticflickr.com/5696/23257755594_b0bbbb490e_o.jpg",
+    "ts": 1772436940
+  },
+  {
+    "photo_id": "31680097894",
+    "url": "https://live.staticflickr.com/505/31680097894_bb1e811d3e_o.jpg",
+    "kw": "portrait",
+    "page": 1,
+    "error_type": "requests.HTTPError",
+    "message": "429 Client Error: Too Many Requests for url: https://live.staticflickr.com/505/31680097894_bb1e811d3e_o.jpg",
+    "ts": 1772436944
+  },
+  {
+    "photo_id": "6702074535",
+    "url": "https://live.staticflickr.com/7005/6702074535_cc16c0b637_o.jpg",
+    "kw": "portrait",
+    "page": 1,
+    "error_type": "requests.HTTPError",
+    "message": "429 Client Error: Too Many Requests for url: https://live.staticflickr.com/7005/6702074535_cc16c0b637_o.jpg",
+    "ts": 1772436953
+  },
+  {
+    "photo_id": "5135414437",
+    "url": "https://live.staticflickr.com/4085/5135414437_921753fab5_o.jpg",
+    "kw": "portrait",
+    "page": 1,
+    "error_type": "requests.HTTPError",
+    "message": "429 Client Error: Too Many Requests for url: https://live.staticflickr.com/4085/5135414437_921753fab5_o.jpg",
+    "ts": 1772436958
   }
 ]

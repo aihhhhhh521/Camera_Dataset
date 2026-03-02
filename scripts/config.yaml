@@ -11,6 +11,8 @@ download:
   max_retries: 3
   sleep_sec: 0.2       # 礼貌爬取（每次请求间隔）
   user_agent: "CameraPoseDatasetBot/1.0 (research; CC-only)"
+  headers_profile: "browser_like"   # minimal / browser_like
+  referer_enabled: true
 
 licenses:
   mode: "allowlist"     # 先建议 cc0_only；后续你要扩大可以改为 allowlist
