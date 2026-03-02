@@ -185,20 +185,36 @@ def get_sizes_best(api_key: str, photo_id: str, ua: str) -> Optional[str]:
 
 def download(url: str, headers: Dict[str, str], timeout: int, max_retries: int) -> bytes:
     last_err = None
-    for _ in range(max_retries):
+    for attempt in range(max_retries):
         try:
             r = requests.get(url, headers=headers, timeout=timeout)
             r.raise_for_status()
             return r.content
-        except requests.Timeout as e:
-            last_err = e
-            time.sleep(0.5)
+
         except requests.HTTPError as e:
+            last_err = e
+            status = e.response.status_code if e.response is not None else 0
+
+            if status == 429:
+                # 优先读取服务器建议的等待时间
+                retry_after = e.response.headers.get("Retry-After")
+                if retry_after:
+                    wait = float(retry_after)
+                else:
+                    # 指数退避：5s, 15s, 45s ...
+                    wait = 5.0 * (3 ** attempt)
+                print(f"[Flickr][429] rate-limited, sleeping {wait:.1f}s before retry {attempt+1}/{max_retries}")
+                time.sleep(wait)
+            else:
+                time.sleep(0.5)
+
+        except requests.Timeout as e:
             last_err = e
             time.sleep(0.5)
         except requests.RequestException as e:
             last_err = e
             time.sleep(0.5)
+
     if last_err is not None:
         raise last_err
     raise RuntimeError(f"download failed: {url} err=unknown")
