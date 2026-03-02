@@ -13,8 +13,8 @@ download:
   user_agent: "CameraPoseDatasetBot/1.0 (research; CC-only)"
 
 licenses:
-  mode: "cc0_only"     # 先建议 cc0_only；后续你要扩大可以改为 allowlist
-  allowlist_openverse: ["cc0"]   # openverse license 参数（cc0/by/by-sa/by-nc/by-nc-sa...）
+  mode: "allowlist"     # 先建议 cc0_only；后续你要扩大可以改为 allowlist
+  allowlist_openverse: ["cc0", "pdm"]   # openverse license 参数（cc0/by/by-sa/by-nc/by-nc-sa...）
   # Flickr 侧我们会动态拉取 license_id 映射，再按“是否 ND”过滤，cc0_only 会只保留 Public Domain/CC0
 
 categories:
@@ -42,10 +42,10 @@ openverse:
   # 可选：有就填，没有就留空（匿名跑）
   client_id: "aguxM6yMlbi5SIq0TrLbZp9q7iHv29WgJTyGPL54"
   client_secret: "1N0bqRKQmVrQ8Re471UcPAAYXK514IdVeTTTJwq1DYW7wkoLDFG2rtClUqdLkkQwmzoK3vXb09gv6s3HbJH3STXmxqXQTXt4HHsgNzVuShHW76Vhcd4oHtSlpl78ePcH"
-  sources: []          # 为空=不限定来源；你也可以填 ["wordpress", "flickr"] 等
+  sources: ["wikimedia","smithsonian"]          # 为空=不限定来源；你也可以填 ["wordpress", "flickr"] 等
 
 flickr:
-  api_key: ""          # 必填
+  api_key: "034e209646d171423b7ee3186b758640"          # 必填
   per_page: 250
   sort: "relevance"
   safe_search: 1       # 1=安全；2=中等；3=限制

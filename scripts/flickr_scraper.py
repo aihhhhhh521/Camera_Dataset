@@ -53,25 +53,35 @@ def is_nd_license(name: str) -> bool:
 
 def choose_allowed_license_ids(license_map: Dict[str, dict], mode: str) -> List[str]:
     """
-    mode=cc0_only: 只取 Public Domain / CC0 类
-    说明：Flickr 的具体 id 会变化/不同地区可能不同，所以这里不硬编码 id，
-    而是根据 license name/url 文本匹配。
+    mode=cc0_only: 只取 Public Domain / CC0
+    mode=allowlist: 取所有 CC / Public Domain（排除 ND 和 All Rights Reserved）
     """
-    ids = []
+    ids: List[str] = []
+
     for lid, info in license_map.items():
+        lid_str = str(lid)
         name = (info.get("name") or "").lower()
         url = (info.get("url") or "").lower()
 
+        # 1) 永远排除 All Rights Reserved
+        if "all rights reserved" in name:
+            continue
+
+        # 2) 永远排除 ND
         if is_nd_license(name):
             continue
 
+        # 3) 只保留 CC / Public Domain（避免混入非开放许可）
+        if ("creativecommons.org" not in url) and ("publicdomain" not in url):
+            continue
+
         if mode == "cc0_only":
-            # 尽量匹配 public domain / cc0
-            if ("public domain" in name) or ("cc0" in name) or ("zero" in name) or ("publicdomain" in url):
-                ids.append(lid)
+            # 只保留 CC0 / Public Domain
+            if ("cc0" in name) or ("public domain" in name) or ("zero" in name) or ("publicdomain" in url):
+                ids.append(lid_str)
         else:
-            # allowlist 模式：你可以自己扩展（例如保留 by/by-sa/by-nc/by-nc-sa，仍排除 nd）
-            ids.append(lid)
+            # allowlist：允许 CC BY / BY-SA / BY-NC / BY-NC-SA / CC0 / PDM（仍已排除 ND）
+            ids.append(lid_str)
 
     return ids
 
@@ -186,7 +196,7 @@ def main():
                         "safe_search": int(fcfg.get("safe_search", 1)),
                         "content_type": int(fcfg.get("content_type", 1)),
                         "media": "photos",
-                        "license": ",".join(allowed_license_ids),  # flickr.photos.search 支持多个 license id :contentReference[oaicite:12]{index=12}
+                        "license": ",".join(map(str, allowed_license_ids)),  # flickr.photos.search 支持多个 license id :contentReference[oaicite:12]{index=12}
                         "extras": ",".join([
                             "license",
                             "owner_name",

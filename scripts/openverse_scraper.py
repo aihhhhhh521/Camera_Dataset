@@ -34,6 +34,7 @@ def get_token(base_url: str, client_id: str, client_secret: str, ua: str) -> Opt
     """
     client_id = (client_id or "").strip()
     client_secret = (client_secret or "").strip()
+
     if not client_id or not client_secret:
         return None
 
@@ -122,9 +123,34 @@ def ov_search_with_retry(
 ) -> tuple[Dict[str, Any], Optional[str]]:
     """
     对 Openverse 查询做一次 401 自动恢复：
-    - 若已有 token：自动刷新 token 后重试。
-    - 若无 token 且无凭据：抛出带操作建议的错误信息。
+    - 优先按当前 token 请求。
+    - 401 时尝试刷新 token 并重试。
+    - 若仍 401，自动回退匿名请求（不带 Authorization），避免因应用权限配置问题直接中断。
     """
+    def _anonymous_fallback(hint: str) -> tuple[Dict[str, Any], Optional[str]]:
+        try:
+            data = ov_search(
+                base_url=base_url,
+                q=q,
+                page=page,
+                page_size=page_size,
+                license_list=license_list,
+                sources=sources,
+                token=None,
+                ua=ua,
+            )
+            print(f"[WARN] {hint} 已自动回退到匿名请求并继续。")
+            return data, None
+        except requests.HTTPError as e3:
+            status3 = e3.response.status_code if e3.response is not None else None
+            if status3 == 401:
+                raise RuntimeError(
+                    "Openverse 认证请求与匿名请求均返回 401。"
+                    "请检查本机网络/代理是否改写了请求头，"
+                    "并确认 Openverse API 在当前网络可直连。"
+                ) from e3
+            raise
+
     try:
         return ov_search(
             base_url=base_url,
@@ -144,9 +170,10 @@ def ov_search_with_retry(
         if token or (client_id and client_secret):
             new_token = get_token(base_url, client_id, client_secret, ua)
             if not new_token:
-                raise RuntimeError(
-                    "Openverse 返回 401，且 token 刷新失败。请检查 openverse.client_id / client_secret 是否有效。"
-                ) from e
+                return _anonymous_fallback(
+                    "Openverse 返回 401，且 token 刷新失败。"
+                    "请检查 openverse.client_id / client_secret 是否有效。",
+                )
             try:
                 data = ov_search(
                     base_url=base_url,
@@ -162,18 +189,16 @@ def ov_search_with_retry(
             except requests.HTTPError as e2:
                 status2 = e2.response.status_code if e2.response is not None else None
                 if status2 == 401:
-                    raise RuntimeError(
+                    return _anonymous_fallback(
                         "Openverse token 获取成功但访问 /images/ 仍返回 401。"
                         "这通常表示 client_id/client_secret 对应应用未获得该 API 访问权限，"
-                        "或当前凭据已失效（请在 Openverse 控制台重置并重新申请权限）。"
-                    ) from e2
+                        "或当前凭据已失效（请在 Openverse 控制台重置并重新申请权限）。",
+                    )
                 raise
 
-        raise RuntimeError(
-            "Openverse API 返回 401 Unauthorized。请在 scripts/config.yaml 的 openverse.client_id "
-            "和 openverse.client_secret 中填入凭据，或设置环境变量 OPENVERSE_CLIENT_ID / "
-            "OPENVERSE_CLIENT_SECRET。"
-        ) from e
+        return _anonymous_fallback(
+            "Openverse API 返回 401 Unauthorized，当前未使用可用凭据。",
+        )
 
 
 def download(url: str, ua: str, timeout: int, max_retries: int) -> bytes:
