@@ -19,7 +19,10 @@ FLICKR_REST = "https://api.flickr.com/services/rest/"
 
 _SESSION: Optional[requests.Session] = None
 LOGGER = logging.getLogger(__name__)
-
+_DOMAIN_429_COUNTS: Dict[str, int] = {}
+_DOMAIN_COOLDOWN_UNTIL: Dict[str, float] = {}
+_FAILED_URL_429_COUNTS: Dict[str, int] = {}
+_FAILED_URL_BLACKLIST: set[str] = set()
 
 def build_api_headers(user_agent: str) -> Dict[str, str]:
     return {"User-Agent": user_agent}
@@ -32,12 +35,18 @@ def build_download_headers(
         referer: Optional[str] = None,
         referer_enabled: bool = True,
 ) -> Dict[str, str]:
+    lang_pool = ["en-US,en;q=0.9", "en-GB,en;q=0.9", "en-US,en;q=0.8,zh-CN;q=0.6"]
+    connection_pool = ["keep-alive", "close"]
     profiles: Dict[str, Dict[str, str]] = {
         "minimal": {},
         "browser_like": {
             "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Connection": "keep-alive",
+            "Accept-Language": random.choice(lang_pool),
+            "Connection": random.choice(connection_pool),
+            "Sec-Fetch-Dest": "image",
+            "Sec-Fetch-Mode": "no-cors",
+            "Sec-Fetch-Site": "cross-site",
+            "Pragma": "no-cache",
         },
     }
     profile_headers = profiles.get(headers_profile, profiles["browser_like"]).copy()
@@ -54,6 +63,22 @@ def _error_type(exc: Exception) -> str:
         return "requests.HTTPError"
     return type(exc).__name__
 
+def _retry_after_from_exc(exc: Exception) -> Optional[str]:
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        return exc.response.headers.get("Retry-After")
+    return None
+
+
+def _attempt_from_message(msg: str) -> Optional[int]:
+    marker = "attempt="
+    if marker not in msg:
+        return None
+    try:
+        raw = msg.split(marker, 1)[1].split()[0].strip(";,)")
+        return int(raw)
+    except (ValueError, IndexError):
+        return None
+
 
 def log_failure(
         *,
@@ -63,6 +88,9 @@ def log_failure(
         page: int,
         error_type: str,
         message: str,
+        retry_after: Optional[str] = None,
+        attempt: Optional[int] = None,
+        headers_profile: Optional[str] = None,
         log_path: Optional[Path] = None,
 ) -> None:
     payload: Dict[str, Any] = {
@@ -72,12 +100,16 @@ def log_failure(
         "page": page,
         "error_type": error_type,
         "message": message,
+        "retry_after": retry_after,
+        "attempt": attempt,
+        "headers_profile": headers_profile,
         "ts": int(time.time()),
     }
     print(
         "[Flickr][warn] "
         f"photo_id={photo_id} kw={kw} page={page} error_type={error_type} "
-        f"url={url} msg={message}"
+        f"url={url} retry_after={retry_after} attempt={attempt} "
+        f"headers_profile={headers_profile} msg={message}"
     )
     if log_path:
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -203,10 +235,29 @@ def get_session() -> requests.Session:
     return _SESSION
 
 
-def download(url: str, headers: Dict[str, str], timeout: int, max_retries: int) -> bytes:
+def download(
+        url: str,
+        headers: Dict[str, str],
+        timeout: int,
+        max_retries: int,
+        domain_429_threshold: int,
+        domain_cooldown_sec_range: tuple[float, float],
+        url_429_blacklist_threshold: int,
+) -> bytes:
     global _SESSION
     session = get_session()
     last_err = None
+    host = urlparse(url).netloc
+
+    if url in _FAILED_URL_BLACKLIST:
+        raise RuntimeError("url_blacklisted_429")
+
+    cooldown_until = _DOMAIN_COOLDOWN_UNTIL.get(host, 0.0)
+    now = time.time()
+    if now < cooldown_until:
+        wait = cooldown_until - now
+        print(f"[Flickr][domain-breaker] host={host} cooling down, sleep={wait:.1f}s")
+        time.sleep(wait)
 
     for attempt in range(max_retries):
         try:
@@ -220,6 +271,8 @@ def download(url: str, headers: Dict[str, str], timeout: int, max_retries: int) 
                 )
             r = session.get(url, headers=headers, timeout=timeout)
             r.raise_for_status()
+            _DOMAIN_429_COUNTS[host] = 0
+            _FAILED_URL_429_COUNTS[url] = 0
             return r.content
 
         except requests.HTTPError as e:
@@ -228,6 +281,24 @@ def download(url: str, headers: Dict[str, str], timeout: int, max_retries: int) 
 
             if status == 429:
                 retry_after = e.response.headers.get("Retry-After")
+                _FAILED_URL_429_COUNTS[url] = _FAILED_URL_429_COUNTS.get(url, 0) + 1
+
+                if host == "live.staticflickr.com":
+                    _DOMAIN_429_COUNTS[host] = _DOMAIN_429_COUNTS.get(host, 0) + 1
+                    if _DOMAIN_429_COUNTS[host] >= domain_429_threshold:
+                        cooldown = random.uniform(*domain_cooldown_sec_range)
+                        _DOMAIN_COOLDOWN_UNTIL[host] = time.time() + cooldown
+                        print(
+                            "[Flickr][domain-breaker] "
+                            f"host={host} consecutive_429={_DOMAIN_429_COUNTS[host]} "
+                            f"sleep={cooldown:.1f}s"
+                        )
+                        time.sleep(cooldown)
+                        _DOMAIN_429_COUNTS[host] = 0
+
+                if _FAILED_URL_429_COUNTS[url] >= url_429_blacklist_threshold:
+                    _FAILED_URL_BLACKLIST.add(url)
+                    raise RuntimeError("url_blacklisted_429") from e
                 if retry_after:
                     wait = float(retry_after)
                 else:
@@ -348,6 +419,11 @@ def main():
                     if not photos:
                         break
 
+                    page_download_attempts = 0
+                    page_429_failures = 0
+                    advance_page_early = False
+                    switch_keyword_early = False
+
                     for ph in photos:
                         if saved >= target:
                             break
@@ -411,9 +487,23 @@ def main():
                         if not url:
                             continue
 
+                        if url in _FAILED_URL_BLACKLIST:
+                            log_failure(
+                                photo_id=photo_id,
+                                url=url,
+                                kw=kw,
+                                page=page,
+                                error_type="RuntimeError",
+                                message="url_blacklisted_429",
+                                headers_profile=headers_profile,
+                                log_path=fail_log_path,
+                            )
+                            continue
+
                         base = float(cfg["download"]["sleep_sec"])
                         time.sleep(base + random.uniform(0, base * 0.5))
                         b = None
+                        page_download_attempts += 1
                         try:
                             b = download(
                                 url,
@@ -425,6 +515,14 @@ def main():
                                 ),
                                 timeout=int(cfg["download"]["timeout_sec"]),
                                 max_retries=int(cfg["download"]["max_retries"]),
+                                domain_429_threshold=int(cfg["download"].get("domain_429_threshold", 3)),
+                                domain_cooldown_sec_range=(
+                                    float(cfg["download"].get("domain_cooldown_min_sec", 300)),
+                                    float(cfg["download"].get("domain_cooldown_max_sec", 900)),
+                                ),
+                                url_429_blacklist_threshold=int(
+                                    cfg["download"].get("url_429_blacklist_threshold", 2)
+                                ),
                             )
                         except requests.Timeout as e:
                             consecutive_download_failures += 1
@@ -435,10 +533,15 @@ def main():
                                 page=page,
                                 error_type=_error_type(e),
                                 message=str(e),
+                                retry_after=_retry_after_from_exc(e),
+                                attempt=int(cfg["download"]["max_retries"]),
+                                headers_profile=headers_profile,
                                 log_path=fail_log_path,
                             )
                         except requests.HTTPError as e:
                             consecutive_download_failures += 1
+                            if e.response is not None and e.response.status_code == 429:
+                                page_429_failures += 1
                             log_failure(
                                 photo_id=photo_id,
                                 url=url,
@@ -446,10 +549,17 @@ def main():
                                 page=page,
                                 error_type=_error_type(e),
                                 message=str(e),
+                                retry_after=_retry_after_from_exc(e),
+                                attempt=int(cfg["download"]["max_retries"]),
+                                headers_profile=headers_profile,
                                 log_path=fail_log_path,
                             )
                         except Exception as e:
                             consecutive_download_failures += 1
+                            if "429" in str(e):
+                                page_429_failures += 1
+                            if "url_blacklisted_429" in str(e):
+                                page_429_failures += 1
                             log_failure(
                                 photo_id=photo_id,
                                 url=url,
@@ -457,6 +567,9 @@ def main():
                                 page=page,
                                 error_type=_error_type(e),
                                 message=str(e),
+                                retry_after=_retry_after_from_exc(e),
+                                attempt=_attempt_from_message(str(e)) or int(cfg["download"]["max_retries"]),
+                                headers_profile=headers_profile,
                                 log_path=fail_log_path,
                             )
                         else:
@@ -472,6 +585,21 @@ def main():
                             consecutive_download_failures = 0
 
                         if b is None:
+                            min_attempts = int(cfg["download"].get("page_429_ratio_min_attempts", 5))
+                            ratio_threshold = float(cfg["download"].get("page_429_ratio_threshold", 0.5))
+                            if page_download_attempts >= min_attempts:
+                                ratio = page_429_failures / page_download_attempts
+                                if ratio >= ratio_threshold:
+                                    print(
+                                        "[Flickr][429-page-guard] "
+                                        f"kw={kw} page={page} ratio={ratio:.2f} "
+                                        f"(429={page_429_failures}/{page_download_attempts})"
+                                    )
+                                    if page == 1:
+                                        switch_keyword_early = True
+                                    else:
+                                        advance_page_early = True
+                                    break
                             continue
 
                         try:
@@ -484,6 +612,9 @@ def main():
                                 page=page,
                                 error_type=_error_type(e),
                                 message=str(e),
+                                retry_after=_retry_after_from_exc(e),
+                                attempt=_attempt_from_message(str(e)),
+                                headers_profile=headers_profile,
                                 log_path=fail_log_path,
                             )
                             continue
@@ -495,6 +626,9 @@ def main():
                                 page=page,
                                 error_type=_error_type(e),
                                 message=str(e),
+                                retry_after=_retry_after_from_exc(e),
+                                attempt=_attempt_from_message(str(e)),
+                                headers_profile=headers_profile,
                                 log_path=fail_log_path,
                             )
                             continue
@@ -506,6 +640,9 @@ def main():
                                 page=page,
                                 error_type=_error_type(e),
                                 message=str(e),
+                                retry_after=_retry_after_from_exc(e),
+                                attempt=_attempt_from_message(str(e)),
+                                headers_profile=headers_profile,
                                 log_path=fail_log_path,
                             )
                             continue
@@ -541,6 +678,12 @@ def main():
 
                         saved += 1
                         pbar.update(1)
+
+                    if switch_keyword_early:
+                        print(f"[Flickr][429-page-guard] switch keyword early: kw={kw} page={page}")
+                        break
+                    if advance_page_early:
+                        print(f"[Flickr][429-page-guard] advance to next page: kw={kw} page={page}")
 
                     page += 1
 

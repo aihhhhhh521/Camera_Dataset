@@ -8,11 +8,17 @@ naming:
 
 download:
   timeout_sec: 30
-  max_retries: 3
-  sleep_sec: 2.5       # 礼貌爬取（每次请求间隔）
-  user_agent: "CameraPoseDatasetBot/1.0 (research; CC-only)"
+  max_retries: 2
+  sleep_sec: 6.0       # 礼貌爬取（每次请求间隔）
+  user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 CameraPoseDatasetBot/1.0 (+research; CC-only)"
   headers_profile: "browser_like"   # minimal / browser_like
   referer_enabled: true
+  domain_429_threshold: 3
+  domain_cooldown_min_sec: 300
+  domain_cooldown_max_sec: 900
+  url_429_blacklist_threshold: 2
+  page_429_ratio_min_attempts: 5
+  page_429_ratio_threshold: 0.5
 
 licenses:
   mode: "allowlist"     # 先建议 cc0_only；后续你要扩大可以改为 allowlist
@@ -48,7 +54,7 @@ openverse:
 
 flickr:
   api_key: "034e209646d171423b7ee3186b758640"          # 必填
-  per_page: 50
+  per_page: 15
   sort: "relevance"
   safe_search: 1       # 1=安全；2=中等；3=限制
   content_type: 1      # photos only
