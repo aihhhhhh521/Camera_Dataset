@@ -5,6 +5,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 import yaml
@@ -17,6 +18,30 @@ from utils_fs import ensure_dirs, next_id, save_image_and_metadata
 
 DEFAULT_API_URL = "https://commons.wikimedia.org/w/api.php"
 
+class RateLimiter:
+    def __init__(self, min_interval_sec: float) -> None:
+        self.min_interval_sec = max(0.0, float(min_interval_sec))
+        self._last_global = 0.0
+        self._last_by_domain: Dict[str, float] = {}
+
+    def wait(self, url: str) -> None:
+        if self.min_interval_sec <= 0:
+            return
+
+        now = time.monotonic()
+        host = urlparse(url).netloc or "global"
+        last_domain = self._last_by_domain.get(host, 0.0)
+        wait_sec = max(
+            0.0,
+            self.min_interval_sec - (now - self._last_global),
+            self.min_interval_sec - (now - last_domain),
+        )
+        if wait_sec > 0:
+            time.sleep(wait_sec)
+
+        ts = time.monotonic()
+        self._last_global = ts
+        self._last_by_domain[host] = ts
 
 def load_cfg() -> dict:
     cfg_path = Path(__file__).with_name("config.yaml")
@@ -62,6 +87,7 @@ def search_commons(
     continue_token: Optional[str],
     per_page: int,
     ua: str,
+    rate_limiter: Optional[RateLimiter],
 ) -> Dict[str, Any]:
     params = {
         "action": "query",
@@ -77,6 +103,9 @@ def search_commons(
     }
     if continue_token:
         params["gsrcontinue"] = continue_token
+
+    if rate_limiter:
+        rate_limiter.wait(api_url)
 
     r = requests.get(api_url, params=params, headers={"User-Agent": ua}, timeout=30)
     r.raise_for_status()
@@ -95,16 +124,24 @@ def allow_license(license_type: str, allowlist: List[str]) -> bool:
     return False
 
 
-def download(url: str, ua: str, timeout: int, max_retries: int) -> bytes:
+def download(url: str, ua: str, timeout: int, max_retries: int, rate_limiter: Optional[RateLimiter], min_interval_sec: float) -> bytes:
     last_err: Optional[Exception] = None
-    for _ in range(max_retries):
+    for retry in range(max_retries):
         try:
+            if rate_limiter:
+                rate_limiter.wait(url)
             r = requests.get(url, headers={"User-Agent": ua}, timeout=timeout)
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                wait_sec = max(min_interval_sec, 0.5 * (2 ** retry))
+                print(f"[Wikicommons] retry status={r.status_code} wait={wait_sec:.2f}s url={url}")
+                time.sleep(wait_sec)
+                last_err = RuntimeError(f"http {r.status_code}")
+                continue
             r.raise_for_status()
             return r.content
         except Exception as e:
             last_err = e
-            time.sleep(0.5)
+            time.sleep(max(min_interval_sec, 0.5 * (2**retry)))
 
     raise RuntimeError(f"download failed: {url} err={last_err}")
 
@@ -147,6 +184,8 @@ def main() -> None:
     init_db(dataset_root)
 
     ua = cfg["download"]["user_agent"]
+    min_interval_sec = float(cfg["download"].get("sleep_sec", 0))
+    rate_limiter = RateLimiter(min_interval_sec)
     pf = PipelineFilter(cfg["pipeline_filter"])
 
     prefixes = cfg["naming"]["prefixes"]
@@ -180,10 +219,15 @@ def main() -> None:
                         continue_token=gsrcontinue,
                         per_page=per_page,
                         ua=ua,
+                        rate_limiter=rate_limiter,
                     )
                     pages = (data.get("query") or {}).get("pages") or {}
                     if not pages:
                         break
+
+                    page_candidates = 0
+                    page_downloaded = 0
+                    page_filter_passed = 0
 
                     for _, page in pages.items():
                         if saved >= target:
@@ -197,6 +241,7 @@ def main() -> None:
                         mime = str(imageinfo.get("mime") or "")
                         if not mime.startswith("image/"):
                             continue
+                        page_candidates += 1
 
                         img_url = imageinfo.get("url")
                         source_page_url = imageinfo.get("descriptionurl") or page.get("fullurl") or ""
@@ -207,14 +252,16 @@ def main() -> None:
                         if not allow_license(license_type, allowlist):
                             continue
 
-                        time.sleep(float(cfg["download"]["sleep_sec"]))
                         try:
                             b = download(
                                 img_url,
                                 ua=ua,
                                 timeout=int(cfg["download"]["timeout_sec"]),
                                 max_retries=int(cfg["download"]["max_retries"]),
+                                rate_limiter=rate_limiter,
+                                min_interval_sec=min_interval_sec,
                             )
+                            page_downloaded += 1
                         except Exception:
                             continue
 
@@ -225,6 +272,7 @@ def main() -> None:
                         ok, metrics, _ = pf.validate(b)
                         if not ok:
                             continue
+                        page_filter_passed += 1
 
                         image_id = next_id(dataset_root, prefixes["wikicommons"], digits)
                         exif_data = exif_extract(b)
@@ -253,6 +301,11 @@ def main() -> None:
 
                         saved += 1
                         pbar.update(1)
+
+                    print(
+                        f"[Wikicommons][{cat}:{kw}] page_stats "
+                        f"candidates={page_candidates} downloaded={page_downloaded} filter_passed={page_filter_passed}"
+                    )
 
                     gsrcontinue = (data.get("continue") or {}).get("gsrcontinue")
                     if not gsrcontinue:
