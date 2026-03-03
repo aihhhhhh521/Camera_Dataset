@@ -29,27 +29,29 @@ licenses:
 
 categories:
   portraits:
-    keywords: ["portrait", "people", "headshot", "lifestyle"]
+    keywords: ["Portrait photography", "Lifestyle photography", "Head shots", "Featured historical portrait photographs"]
     target_count: 1000
   animals_plants:
-    keywords: ["wildlife", "bird", "flower", "plant"]
+    keywords: ["Wildlife", "Flowers", "Plants", "Birds in flight"]
     target_count: 1000
   natural_landscapes:
-    keywords: ["landscape", "mountain", "ocean", "sunset"]
+    keywords: ["Landscapes", "Mountains", "Seascapes", "Featured pictures of landscapes"]
     target_count: 1000
   urban_architecture:
-    keywords: ["architecture", "city", "street", "building"]
+    keywords: ["Architectural photography", "Cityscapes", "Street photography", "Buildings"]
     target_count: 1000
   food_still_life:
-    keywords: ["food", "coffee", "dessert", "still life"]
+    keywords: ["Still-life photography", "Food photography", "Desserts", "Coffee and food"]
     target_count: 500
   sports_events:
-    keywords: ["sports", "marathon", "basketball", "festival"]
+    keywords: ["Sports events", "Sports competitions", "Festival", "Motions"]
     target_count: 500
 
 wikicommons:
   api_url: "https://commons.wikimedia.org/w/api.php"
   per_page: 50
+  primary_ratio: 0.7      # 主关键词目标占比；主关键词不足时会自动由辅关键词补齐
+  secondary_mode: "round_robin"   # 辅关键词轮询抓取（每轮每个关键词抓一页）
   license_allowlist: ["cc0", "public domain", "cc-by", "cc-by-sa", "pdm"]
 
 openverse:

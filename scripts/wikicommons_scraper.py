@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import math
 import re
 import time
 from email.utils import parsedate_to_datetime
@@ -265,6 +266,9 @@ def main() -> None:
     wc_cfg = cfg["wikicommons"]
     api_url = wc_cfg.get("api_url", DEFAULT_API_URL)
     per_page = int(wc_cfg.get("per_page", 50))
+    primary_ratio = float(wc_cfg.get("primary_ratio", 0.7))
+    primary_ratio = max(0.0, min(1.0, primary_ratio))
+    secondary_mode = str(wc_cfg.get("secondary_mode", "round_robin")).strip().lower()
     if cfg["licenses"].get("mode") == "cc0_only":
         allowlist = ["cc0", "public domain", "pdm"]
     else:
@@ -274,113 +278,183 @@ def main() -> None:
         target = int(spec.get("target_count", 0))
         keywords = spec.get("keywords", [])
         saved = 0
+        primary_saved = 0
+        secondary_saved = 0
 
-        print(f"\n[Wikicommons] category={cat} target={target} keywords={keywords}")
+        if not keywords:
+            print(f"\n[Wikicommons] category={cat} has no keywords, skip.")
+            continue
 
-        for kw in keywords:
-            if saved >= target:
-                break
+        primary_kw = keywords[0]
+        secondary_kws = keywords[1:]
 
-            gsrcontinue: Optional[str] = None
-            with tqdm(total=target, initial=saved, desc=f"WCM {cat}:{kw}", unit="img") as pbar:
-                while saved < target:
-                    data = search_commons(
-                        api_url=api_url,
-                        keyword=kw,
-                        continue_token=gsrcontinue,
-                        per_page=per_page,
+        primary_target = min(target, math.ceil(target * primary_ratio))
+        secondary_target = target - primary_target
+
+        print(
+            f"\n[Wikicommons] category={cat} target={target} "
+            f"primary_kw={primary_kw} secondary_kws={secondary_kws} "
+            f"primary_target={primary_target} secondary_target={secondary_target} "
+            f"secondary_mode={secondary_mode}"
+        )
+
+        def process_keyword_page(kw: str, gsrcontinue: Optional[str], stage: str) -> Tuple[int, Optional[str], bool]:
+            nonlocal saved, primary_saved, secondary_saved
+
+            data = search_commons(
+                api_url=api_url,
+                keyword=kw,
+                continue_token=gsrcontinue,
+                per_page=per_page,
+                ua=ua,
+                rate_limiter=rate_limiter,
+            )
+            pages = (data.get("query") or {}).get("pages") or {}
+            if not pages:
+                print(
+                    f"[Wikicommons][{cat}:{kw}][{stage}] page_stats candidates=0 downloaded=0 filter_passed=0 accepted=0")
+                return 0, None, False
+
+            page_candidates = 0
+            page_downloaded = 0
+            page_filter_passed = 0
+            page_accepted = 0
+
+            for _, page in pages.items():
+                if saved >= target:
+                    break
+
+                imageinfo_list = page.get("imageinfo") or []
+                if not imageinfo_list:
+                    continue
+
+                imageinfo = imageinfo_list[0]
+                mime = str(imageinfo.get("mime") or "")
+                if not mime.startswith("image/"):
+                    continue
+                page_candidates += 1
+
+                img_url = imageinfo.get("url")
+                source_page_url = imageinfo.get("descriptionurl") or page.get("fullurl") or ""
+                if not img_url:
+                    continue
+
+                license_type, license_url = extract_license_fields(imageinfo)
+                if not allow_license(license_type, allowlist):
+                    continue
+
+                try:
+                    b = download(
+                        img_url,
                         ua=ua,
+                        timeout=int(cfg["download"]["timeout_sec"]),
+                        max_retries=int(cfg["download"]["max_retries"]),
                         rate_limiter=rate_limiter,
+                        min_interval_sec=min_interval_sec,
                     )
-                    pages = (data.get("query") or {}).get("pages") or {}
-                    if not pages:
-                        break
+                    page_downloaded += 1
+                except Exception:
+                    continue
 
-                    page_candidates = 0
-                    page_downloaded = 0
-                    page_filter_passed = 0
+                s256 = sha256_bytes(b)
+                if has_sha256(dataset_root, s256):
+                    continue
 
-                    for _, page in pages.items():
+                ok, metrics, _ = pf.validate(b)
+                if not ok:
+                    continue
+                page_filter_passed += 1
+
+                image_id = next_id(dataset_root, prefixes["wikicommons"], digits)
+                exif_data = exif_extract(b)
+
+                ext = imageinfo.get("extmetadata") or {}
+                author = clean_text((ext.get("Artist") or {}).get("value"))
+
+                h = int(metrics.get("H", 0))
+                w = int(metrics.get("W", 0))
+                md = build_metadata(
+                    image_id=image_id,
+                    category=cat,
+                    original_url=img_url,
+                    source_page_url=source_page_url,
+                    author=author,
+                    license_type=license_type,
+                    license_url=license_url,
+                    search_keyword=kw,
+                    resolution_hw=(h, w),
+                    exif_data=exif_data,
+                    pipeline_metrics=metrics,
+                )
+
+                save_image_and_metadata(dataset_root, cat, image_id, b, md)
+                add_sha256(dataset_root, s256, image_id, "wikicommons")
+
+                saved += 1
+                page_accepted += 1
+                if stage == "primary":
+                    primary_saved += 1
+                else:
+                    secondary_saved += 1
+
+            print(
+                f"[Wikicommons][{cat}:{kw}][{stage}] page_stats "
+                f"candidates={page_candidates} downloaded={page_downloaded} "
+                f"filter_passed={page_filter_passed} accepted={page_accepted}"
+            )
+
+            next_continue = (data.get("continue") or {}).get("gsrcontinue")
+            return page_accepted, next_continue, True
+
+        with tqdm(total=target, initial=saved, desc=f"WCM {cat}", unit="img") as pbar:
+            # Phase 1: primary keyword
+            primary_continue: Optional[str] = None
+            while saved < primary_target:
+                accepted, primary_continue, has_pages = process_keyword_page(primary_kw, primary_continue, "primary")
+                if accepted > 0:
+                    pbar.update(accepted)
+                if not has_pages or not primary_continue:
+                    break
+
+            # Phase 2: secondary keywords in round-robin
+            if saved < target and secondary_kws:
+                if secondary_mode != "round_robin":
+                    print(f"[Wikicommons] unsupported secondary_mode={secondary_mode}, fallback to round_robin")
+                gsrcontinue_map: Dict[str, Optional[str]] = {kw: None for kw in secondary_kws}
+                exhausted_kws = set()
+
+                while saved < target and len(exhausted_kws) < len(secondary_kws):
+                    progressed = False
+                    for kw in secondary_kws:
                         if saved >= target:
                             break
-
-                        imageinfo_list = page.get("imageinfo") or []
-                        if not imageinfo_list:
+                        if kw in exhausted_kws:
                             continue
 
-                        imageinfo = imageinfo_list[0]
-                        mime = str(imageinfo.get("mime") or "")
-                        if not mime.startswith("image/"):
-                            continue
-                        page_candidates += 1
-
-                        img_url = imageinfo.get("url")
-                        source_page_url = imageinfo.get("descriptionurl") or page.get("fullurl") or ""
-                        if not img_url:
-                            continue
-
-                        license_type, license_url = extract_license_fields(imageinfo)
-                        if not allow_license(license_type, allowlist):
-                            continue
-
-                        try:
-                            b = download(
-                                img_url,
-                                ua=ua,
-                                timeout=int(cfg["download"]["timeout_sec"]),
-                                max_retries=int(cfg["download"]["max_retries"]),
-                                rate_limiter=rate_limiter,
-                                min_interval_sec=min_interval_sec,
-                            )
-                            page_downloaded += 1
-                        except Exception:
-                            continue
-
-                        s256 = sha256_bytes(b)
-                        if has_sha256(dataset_root, s256):
-                            continue
-
-                        ok, metrics, _ = pf.validate(b)
-                        if not ok:
-                            continue
-                        page_filter_passed += 1
-
-                        image_id = next_id(dataset_root, prefixes["wikicommons"], digits)
-                        exif_data = exif_extract(b)
-
-                        ext = imageinfo.get("extmetadata") or {}
-                        author = clean_text((ext.get("Artist") or {}).get("value"))
-
-                        h = int(metrics.get("H", 0))
-                        w = int(metrics.get("W", 0))
-                        md = build_metadata(
-                            image_id=image_id,
-                            category=cat,
-                            original_url=img_url,
-                            source_page_url=source_page_url,
-                            author=author,
-                            license_type=license_type,
-                            license_url=license_url,
-                            search_keyword=kw,
-                            resolution_hw=(h, w),
-                            exif_data=exif_data,
-                            pipeline_metrics=metrics,
+                        accepted, next_continue, has_pages = process_keyword_page(
+                            kw,
+                            gsrcontinue_map.get(kw),
+                            "secondary",
                         )
 
-                        save_image_and_metadata(dataset_root, cat, image_id, b, md)
-                        add_sha256(dataset_root, s256, image_id, "wikicommons")
+                        if accepted > 0:
+                            pbar.update(accepted)
+                            progressed = True
 
-                        saved += 1
-                        pbar.update(1)
+                        if not has_pages or not next_continue:
+                            exhausted_kws.add(kw)
+                        else:
+                            gsrcontinue_map[kw] = next_continue
 
-                    print(
-                        f"[Wikicommons][{cat}:{kw}] page_stats "
-                        f"candidates={page_candidates} downloaded={page_downloaded} filter_passed={page_filter_passed}"
-                    )
+                        if not progressed and len(exhausted_kws) < len(secondary_kws):
+                            # 轮询一圈无入库，继续翻页尝试，直到关键词耗尽或 target 达成
+                            continue
 
-                    gsrcontinue = (data.get("continue") or {}).get("gsrcontinue")
-                    if not gsrcontinue:
-                        break
+                        print(
+                            f"[Wikicommons][{cat}] stage_summary "
+                            f"primary_saved={primary_saved}/{primary_target} "
+                            f"secondary_saved={secondary_saved}/{secondary_target} total_saved={saved}/{target}"
+                        )
 
     print("\n[Wikicommons] done.")
 
