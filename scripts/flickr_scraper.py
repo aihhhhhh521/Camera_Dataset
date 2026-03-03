@@ -2,9 +2,11 @@ from __future__ import annotations
 import json
 import time
 import random
+import logging
 import requests
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import yaml
 from tqdm import tqdm
@@ -16,6 +18,7 @@ from hash_db import init_db, has_sha256, add_sha256
 FLICKR_REST = "https://api.flickr.com/services/rest/"
 
 _SESSION: Optional[requests.Session] = None
+LOGGER = logging.getLogger(__name__)
 
 
 def build_api_headers(user_agent: str) -> Dict[str, str]:
@@ -186,12 +189,11 @@ def get_sizes_best(api_key: str, photo_id: str, ua: str) -> Optional[str]:
     return best
 
 
-def get_session(headers: Dict[str, str]) -> requests.Session:
+def get_session() -> requests.Session:
     """复用 Session，并预热获取 Flickr CDN Cookie"""
     global _SESSION
     if _SESSION is None:
         _SESSION = requests.Session()
-        _SESSION.headers.update(headers)
         # 预热：访问 Flickr 首页获取 session cookie，模拟真实浏览器行为
         try:
             _SESSION.get("https://www.flickr.com/", timeout=10)
@@ -202,12 +204,21 @@ def get_session(headers: Dict[str, str]) -> requests.Session:
 
 
 def download(url: str, headers: Dict[str, str], timeout: int, max_retries: int) -> bytes:
-    session = get_session(headers)
+    global _SESSION
+    session = get_session()
     last_err = None
 
     for attempt in range(max_retries):
         try:
-            r = session.get(url, timeout=timeout)
+            referer = headers.get("Referer", "")
+            if LOGGER.isEnabledFor(logging.DEBUG):
+                LOGGER.debug(
+                    "download request referer_host=%s url_host=%s url=%s",
+                    urlparse(referer).netloc if referer else "",
+                    urlparse(url).netloc,
+                    url,
+                )
+            r = session.get(url, headers=headers, timeout=timeout)
             r.raise_for_status()
             return r.content
 
@@ -227,6 +238,7 @@ def download(url: str, headers: Dict[str, str], timeout: int, max_retries: int) 
                 time.sleep(wait)
                 # 429 后重建 session，刷新连接状态
                 _SESSION = None
+                print("[Flickr][429] session reset done")
             else:
                 time.sleep(random.uniform(0.3, 1.0))
 

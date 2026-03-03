@@ -1,9 +1,11 @@
 from __future__ import annotations
+import json
 import os
 import time
 import requests
 from typing import Dict, Any, List, Optional
 from pathlib import Path
+from datetime import datetime, timezone
 
 import yaml
 from tqdm import tqdm
@@ -11,6 +13,80 @@ from tqdm import tqdm
 from utils_fs import ensure_dirs, next_id, save_image_and_metadata
 from pipeline_filter import PipelineFilter, sha256_bytes, exif_extract
 from hash_db import init_db, has_sha256, add_sha256
+
+
+DIAG_LOG_PATH = Path(__file__).with_name("logs") / "openverse_diag.jsonl"
+DIAG_HEADER_KEYS = ("Server", "Via", "X-Cache", "CF-RAY", "CF-Cache-Status", "CF-Connecting-IP")
+
+
+def write_diag_log(event: str, payload: Dict[str, Any]) -> None:
+    DIAG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+        **payload,
+    }
+    with DIAG_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def collect_http_error_info(err: requests.HTTPError) -> Dict[str, Any]:
+    response = err.response
+    if response is None:
+        return {"status_code": None, "url": None, "headers": {}, "body_head": ""}
+    headers = {k: v for k, v in response.headers.items() if k in DIAG_HEADER_KEYS or k.upper().startswith("CF-")}
+    return {
+        "status_code": response.status_code,
+        "url": response.url,
+        "headers": headers,
+        "body_head": (response.text or "")[:300],
+    }
+
+
+def report_http_error(context: str, err: requests.HTTPError) -> Dict[str, Any]:
+    info = collect_http_error_info(err)
+    print(
+        f"[HTTPError][{context}] status={info['status_code']} url={info['url']} "
+        f"headers={info['headers']} body_head={info['body_head']!r}"
+    )
+    write_diag_log(f"http_error.{context}", info)
+    return info
+
+
+def probe_openverse_connectivity(base_url: str, ua: str) -> Dict[str, Any]:
+    headers = {"User-Agent": ua}
+    checks = {
+        "anonymous_images": {
+            "method": "GET",
+            "url": base_url.rstrip("/") + "/images/?q=test&page=1&page_size=1",
+        },
+        "auth_token_endpoint": {
+            "method": "POST",
+            "url": base_url.rstrip("/") + "/auth_tokens/token/",
+            "data": {"grant_type": "client_credentials"},
+        },
+    }
+
+    results: Dict[str, Any] = {}
+    for name, req in checks.items():
+        try:
+            if req["method"] == "GET":
+                resp = requests.get(req["url"], headers=headers, timeout=15)
+            else:
+                resp = requests.post(req["url"], headers=headers, data=req.get("data"), timeout=15)
+            results[name] = {
+                "status_code": resp.status_code,
+                "url": resp.url,
+                "headers": {k: v for k, v in resp.headers.items() if k in DIAG_HEADER_KEYS or k.upper().startswith("CF-")},
+                "body_head": (resp.text or "")[:300],
+            }
+        except requests.RequestException as ex:
+            results[name] = {"error": repr(ex)}
+
+    write_diag_log("connectivity_probe", results)
+    print(f"[DIAG] Openverse connectivity probe: {results}")
+    return results
+
 
 def load_cfg() -> dict:
     cfg_path = Path(__file__).with_name("config.yaml")
@@ -63,18 +139,37 @@ def get_token(base_url: str, client_id: str, client_secret: str, ua: str) -> Opt
     ]
 
     for idx, attempt in enumerate(attempts, start=1):
-        r = requests.post(token_url, headers=headers, timeout=30, **attempt["kwargs"])
-        if r.status_code != 200:
+        try:
+            r = requests.post(token_url, headers=headers, timeout=30, **attempt["kwargs"])
+            r.raise_for_status()
+
+            token = (r.json().get("access_token") or "").strip()
+            if token:
+                return token
+            print(f"[WARN] Openverse token attempt#{idx} succeeded but access_token is empty")
+            write_diag_log(
+                "token_empty",
+                {
+                    "attempt": idx,
+                    "attempt_name": attempt["name"],
+                    "status_code": r.status_code,
+                    "url": r.url,
+                },
+            )
+        except requests.HTTPError as e:
+            info = report_http_error(f"get_token.{attempt['name']}", e)
             print(
                 f"[WARN] Openverse token attempt#{idx} ({attempt['name']}) failed: "
-                f"{r.status_code} {r.text[:200]}"
+                f"{info['status_code']}"
             )
             continue
-
-        token = (r.json().get("access_token") or "").strip()
-        if token:
-            return token
-        print(f"[WARN] Openverse token attempt#{idx} succeeded but access_token is empty")
+        except requests.RequestException as e:
+            print(f"[WARN] Openverse token attempt#{idx} ({attempt['name']}) request error: {e}")
+            write_diag_log(
+                "token_request_exception",
+                {"attempt": idx, "attempt_name": attempt["name"], "error": repr(e)},
+            )
+            continue
 
     return None
 
@@ -142,12 +237,12 @@ def ov_search_with_retry(
             print(f"[WARN] {hint} 已自动回退到匿名请求并继续。")
             return data, None
         except requests.HTTPError as e3:
-            status3 = e3.response.status_code if e3.response is not None else None
+            info3 = report_http_error("ov_search_with_retry.anonymous_fallback", e3)
+            status3 = info3["status_code"]
             if status3 == 401:
                 raise RuntimeError(
-                    "Openverse 认证请求与匿名请求均返回 401。"
-                    "请检查本机网络/代理是否改写了请求头，"
-                    "并确认 Openverse API 在当前网络可直连。"
+                    "Openverse 认证请求与匿名请求均返回 401。疑似网络链路拦截/代理改写。"
+                    "建议排查：关闭系统代理、切换网络、检查企业网关策略。"
                 ) from e3
             raise
 
@@ -163,7 +258,8 @@ def ov_search_with_retry(
             ua=ua,
         ), token
     except requests.HTTPError as e:
-        status = e.response.status_code if e.response is not None else None
+        info = report_http_error("ov_search_with_retry.initial", e)
+        status = info["status_code"]
         if status != 401:
             raise
 
@@ -187,7 +283,8 @@ def ov_search_with_retry(
                 )
                 return data, new_token
             except requests.HTTPError as e2:
-                status2 = e2.response.status_code if e2.response is not None else None
+                info2 = report_http_error("ov_search_with_retry.retry_with_new_token", e2)
+                status2 = info2["status_code"]
                 if status2 == 401:
                     return _anonymous_fallback(
                         "Openverse token 获取成功但访问 /images/ 仍返回 401。"
@@ -256,6 +353,8 @@ def main():
 
     ov_cfg = cfg["openverse"]
     base_url = ov_cfg["base_url"]
+
+    probe_openverse_connectivity(base_url, ua)
 
     # 许可策略：默认 cc0_only（最稳）
     if cfg["licenses"]["mode"] == "cc0_only":
