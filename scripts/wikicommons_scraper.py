@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import re
 import time
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -17,6 +18,8 @@ from utils_fs import ensure_dirs, next_id, save_image_and_metadata
 
 
 DEFAULT_API_URL = "https://commons.wikimedia.org/w/api.php"
+DEFAULT_RETRY_BASE_SEC = 0.5
+DEFAULT_RETRY_MAX_WAIT_SEC = 60.0
 
 class RateLimiter:
     def __init__(self, min_interval_sec: float) -> None:
@@ -104,13 +107,91 @@ def search_commons(
     if continue_token:
         params["gsrcontinue"] = continue_token
 
-    if rate_limiter:
-        rate_limiter.wait(api_url)
-
-    r = requests.get(api_url, params=params, headers={"User-Agent": ua}, timeout=30)
-    r.raise_for_status()
+    r = request_with_retry(
+        api_url,
+        ua=ua,
+        timeout=30,
+        max_retries=5,
+        rate_limiter=rate_limiter,
+        min_interval_sec=0,
+        params=params,
+    )
     return r.json()
 
+
+def parse_retry_after(headers: requests.structures.CaseInsensitiveDict) -> Optional[float]:
+    value = headers.get("Retry-After")
+    if not value:
+        return None
+    value = value.strip()
+
+    if value.isdigit():
+        return max(0.0, float(value))
+
+    try:
+        retry_at = parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+    now = time.time()
+    return max(0.0, retry_at.timestamp() - now)
+
+
+def compute_retry_wait(
+        *,
+        retry_idx: int,
+        min_interval_sec: float,
+        retry_after_sec: Optional[float],
+        base_backoff_sec: float = DEFAULT_RETRY_BASE_SEC,
+        max_wait_sec: float = DEFAULT_RETRY_MAX_WAIT_SEC,
+) -> float:
+    exp_backoff = max(min_interval_sec, base_backoff_sec * (2 ** retry_idx))
+    if retry_after_sec is not None:
+        return min(max_wait_sec, max(retry_after_sec, exp_backoff))
+    return min(max_wait_sec, exp_backoff)
+
+
+def request_with_retry(
+        url: str,
+        *,
+        ua: str,
+        timeout: int,
+        max_retries: int,
+        rate_limiter: Optional[RateLimiter],
+        min_interval_sec: float,
+        params: Optional[Dict[str, Any]] = None,
+) -> requests.Response:
+    last_err: Optional[Exception] = None
+    for retry in range(max_retries):
+        try:
+            if rate_limiter:
+                rate_limiter.wait(url)
+            r = requests.get(url, params=params, headers={"User-Agent": ua}, timeout=timeout)
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                retry_after_sec = parse_retry_after(r.headers)
+                wait_sec = compute_retry_wait(
+                    retry_idx=retry,
+                    min_interval_sec=min_interval_sec,
+                    retry_after_sec=retry_after_sec,
+                )
+                print(f"[Wikicommons] retry status={r.status_code} wait={wait_sec:.2f}s url={url}")
+                time.sleep(wait_sec)
+                last_err = RuntimeError(f"http {r.status_code}")
+                continue
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            last_err = e
+            if retry == max_retries - 1:
+                break
+            wait_sec = compute_retry_wait(
+                retry_idx=retry,
+                min_interval_sec=min_interval_sec,
+                retry_after_sec=None,
+            )
+            time.sleep(wait_sec)
+
+        raise RuntimeError(f"request failed: {url} err={last_err}")
 
 def allow_license(license_type: str, allowlist: List[str]) -> bool:
     if not allowlist:
@@ -125,25 +206,15 @@ def allow_license(license_type: str, allowlist: List[str]) -> bool:
 
 
 def download(url: str, ua: str, timeout: int, max_retries: int, rate_limiter: Optional[RateLimiter], min_interval_sec: float) -> bytes:
-    last_err: Optional[Exception] = None
-    for retry in range(max_retries):
-        try:
-            if rate_limiter:
-                rate_limiter.wait(url)
-            r = requests.get(url, headers={"User-Agent": ua}, timeout=timeout)
-            if r.status_code == 429 or 500 <= r.status_code < 600:
-                wait_sec = max(min_interval_sec, 0.5 * (2 ** retry))
-                print(f"[Wikicommons] retry status={r.status_code} wait={wait_sec:.2f}s url={url}")
-                time.sleep(wait_sec)
-                last_err = RuntimeError(f"http {r.status_code}")
-                continue
-            r.raise_for_status()
-            return r.content
-        except Exception as e:
-            last_err = e
-            time.sleep(max(min_interval_sec, 0.5 * (2**retry)))
-
-    raise RuntimeError(f"download failed: {url} err={last_err}")
+    response = request_with_retry(
+        url,
+        ua=ua,
+        timeout=timeout,
+        max_retries=max_retries,
+        rate_limiter=rate_limiter,
+        min_interval_sec=min_interval_sec,
+    )
+    return response.content
 
 
 def build_metadata(

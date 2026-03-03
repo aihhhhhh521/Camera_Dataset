@@ -30,10 +30,10 @@ licenses:
 categories:
   portraits:
     keywords: ["portrait", "people", "headshot", "lifestyle"]
-    target_count: 1
+    target_count: 1000
   animals_plants:
     keywords: ["wildlife", "bird", "flower", "plant"]
-    target_count: 1
+    target_count: 1000
   natural_landscapes:
     keywords: ["landscape", "mountain", "ocean", "sunset"]
     target_count: 1000
