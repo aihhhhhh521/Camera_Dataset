@@ -2,6 +2,7 @@ dataset_root: "../"   # 指向 My_CameraPose_Dataset 根目录（scripts 的上�
 
 naming:
   prefixes:
+    wikicommons: "WCM"
     openverse: "OPV"
     flickr: "FLK"
   digits: 5            # OPV_00001 这种位数
@@ -23,6 +24,7 @@ download:
 licenses:
   mode: "allowlist"     # 先建议 cc0_only；后续你要扩大可以改为 allowlist
   allowlist_openverse: ["cc0", "pdm"]   # openverse license 参数（cc0/by/by-sa/by-nc/by-nc-sa...）
+  allowlist_wikicommons: ["cc0", "public domain", "cc-by", "cc-by-sa", "pdm"]
   # Flickr 侧我们会动态拉取 license_id 映射，再按“是否 ND”过滤，cc0_only 会只保留 Public Domain/CC0
 
 categories:
@@ -44,6 +46,11 @@ categories:
   sports_events:
     keywords: ["sports", "marathon", "basketball", "festival"]
     target_count: 500
+
+wikicommons:
+  api_url: "https://commons.wikimedia.org/w/api.php"
+  per_page: 50
+  license_allowlist: ["cc0", "public domain", "cc-by", "cc-by-sa", "pdm"]
 
 openverse:
   base_url: "https://api.openverse.org/v1"
