@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import math
+import random
 import re
 import time
 from email.utils import parsedate_to_datetime
@@ -27,19 +28,33 @@ class RateLimiter:
         self.min_interval_sec = max(0.0, float(min_interval_sec))
         self._last_global = 0.0
         self._last_by_domain: Dict[str, float] = {}
+        self._blocked_until_by_domain: Dict[str, float] = {}
+
+    def _host_from_url(self, url: str) -> str:
+        return urlparse(url).netloc or "global"
+
+    def penalize(self, url: str, wait_sec: float) -> None:
+        if wait_sec <= 0:
+            return
+        host = self._host_from_url(url)
+        deadline = time.monotonic() + wait_sec
+        self._blocked_until_by_domain[host] = max(self._blocked_until_by_domain.get(host, 0.0), deadline)
 
     def wait(self, url: str) -> None:
-        if self.min_interval_sec <= 0:
-            return
+        host = self._host_from_url(url)
 
         now = time.monotonic()
-        host = urlparse(url).netloc or "global"
-        last_domain = self._last_by_domain.get(host, 0.0)
-        wait_sec = max(
-            0.0,
-            self.min_interval_sec - (now - self._last_global),
-            self.min_interval_sec - (now - last_domain),
-        )
+        blocked_until = self._blocked_until_by_domain.get(host, 0.0)
+
+        wait_sec = max(0.0, blocked_until - now)
+
+        if self.min_interval_sec > 0:
+            last_domain = self._last_by_domain.get(host, 0.0)
+            wait_sec = max(
+                wait_sec,
+                self.min_interval_sec - (now - self._last_global),
+                self.min_interval_sec - (now - last_domain),
+            )
         if wait_sec > 0:
             time.sleep(wait_sec)
 
@@ -175,8 +190,13 @@ def request_with_retry(
                     min_interval_sec=min_interval_sec,
                     retry_after_sec=retry_after_sec,
                 )
-                print(f"[Wikicommons] retry status={r.status_code} wait={wait_sec:.2f}s url={url}")
-                time.sleep(wait_sec)
+                jitter_sec = min(2.0, wait_sec * 0.25) * random.random()
+                effective_wait = wait_sec + jitter_sec
+                print(f"[Wikicommons] retry status={r.status_code} wait={effective_wait:.2f}s url={url}")
+                if rate_limiter:
+                    rate_limiter.penalize(url, effective_wait)
+                else:
+                    time.sleep(effective_wait)
                 last_err = RuntimeError(f"http {r.status_code}")
                 continue
             r.raise_for_status()
@@ -192,7 +212,7 @@ def request_with_retry(
             )
             time.sleep(wait_sec)
 
-        raise RuntimeError(f"request failed: {url} err={last_err}")
+    raise RuntimeError(f"request failed: {url} err={last_err}")
 
 def allow_license(license_type: str, allowlist: List[str]) -> bool:
     if not allowlist:
