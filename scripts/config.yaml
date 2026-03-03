@@ -9,7 +9,7 @@ naming:
 download:
   timeout_sec: 30
   max_retries: 3
-  sleep_sec: 1.5       # 礼貌爬取（每次请求间隔）
+  sleep_sec: 2.5       # 礼貌爬取（每次请求间隔）
   user_agent: "CameraPoseDatasetBot/1.0 (research; CC-only)"
   headers_profile: "browser_like"   # minimal / browser_like
   referer_enabled: true
@@ -22,10 +22,10 @@ licenses:
 categories:
   portraits:
     keywords: ["portrait", "people", "headshot", "lifestyle"]
-    target_count: 1000
+    target_count: 1
   animals_plants:
     keywords: ["wildlife", "bird", "flower", "plant"]
-    target_count: 1000
+    target_count: 1
   natural_landscapes:
     keywords: ["landscape", "mountain", "ocean", "sunset"]
     target_count: 1000
@@ -48,12 +48,12 @@ openverse:
 
 flickr:
   api_key: "034e209646d171423b7ee3186b758640"          # 必填
-  per_page: 100
+  per_page: 50
   sort: "relevance"
   safe_search: 1       # 1=安全；2=中等；3=限制
   content_type: 1      # photos only
-  consecutive_fail_threshold: 5
-  consecutive_fail_sleep_sec: 60
+  consecutive_fail_threshold: 3
+  consecutive_fail_sleep_sec: 120
 
 pipeline_filter:
   enabled: true

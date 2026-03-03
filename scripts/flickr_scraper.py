@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import time
+import random
 import requests
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -13,6 +14,8 @@ from pipeline_filter import PipelineFilter, sha256_bytes, exif_extract
 from hash_db import init_db, has_sha256, add_sha256
 
 FLICKR_REST = "https://api.flickr.com/services/rest/"
+
+_SESSION: Optional[requests.Session] = None
 
 
 def build_api_headers(user_agent: str) -> Dict[str, str]:
@@ -158,7 +161,7 @@ def choose_allowed_license_ids(license_map: Dict[str, dict], mode: str) -> List[
 
 def best_download_url(photo: dict) -> Optional[str]:
     # extras 里如果有 url_o（原图）就用，否则降级
-    for k in ["url_o", "url_l", "url_c", "url_z"]:
+    for k in ["url_b", "url_c", "url_l", "url_o", "url_z"]:
         if k in photo:
             return photo[k]
     return None
@@ -183,11 +186,28 @@ def get_sizes_best(api_key: str, photo_id: str, ua: str) -> Optional[str]:
     return best
 
 
+def get_session(headers: Dict[str, str]) -> requests.Session:
+    """复用 Session，并预热获取 Flickr CDN Cookie"""
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = requests.Session()
+        _SESSION.headers.update(headers)
+        # 预热：访问 Flickr 首页获取 session cookie，模拟真实浏览器行为
+        try:
+            _SESSION.get("https://www.flickr.com/", timeout=10)
+            time.sleep(random.uniform(1.0, 2.0))
+        except Exception:
+            pass
+    return _SESSION
+
+
 def download(url: str, headers: Dict[str, str], timeout: int, max_retries: int) -> bytes:
+    session = get_session(headers)
     last_err = None
+
     for attempt in range(max_retries):
         try:
-            r = requests.get(url, headers=headers, timeout=timeout)
+            r = session.get(url, timeout=timeout)
             r.raise_for_status()
             return r.content
 
@@ -196,28 +216,27 @@ def download(url: str, headers: Dict[str, str], timeout: int, max_retries: int) 
             status = e.response.status_code if e.response is not None else 0
 
             if status == 429:
-                # 优先读取服务器建议的等待时间
                 retry_after = e.response.headers.get("Retry-After")
                 if retry_after:
                     wait = float(retry_after)
                 else:
-                    # 指数退避：5s, 15s, 45s ...
-                    wait = 5.0 * (3 ** attempt)
-                print(f"[Flickr][429] rate-limited, sleeping {wait:.1f}s before retry {attempt+1}/{max_retries}")
+                    # 指数退避 + 随机抖动，避免规律性请求
+                    base_wait = 10.0 * (3 ** attempt)
+                    wait = base_wait + random.uniform(0, base_wait * 0.3)
+                print(f"[Flickr][429] sleeping {wait:.1f}s (attempt {attempt + 1}/{max_retries})")
                 time.sleep(wait)
+                # 429 后重建 session，刷新连接状态
+                _SESSION = None
             else:
-                time.sleep(0.5)
+                time.sleep(random.uniform(0.3, 1.0))
 
-        except requests.Timeout as e:
+        except (requests.Timeout, requests.RequestException) as e:
             last_err = e
-            time.sleep(0.5)
-        except requests.RequestException as e:
-            last_err = e
-            time.sleep(0.5)
+            time.sleep(random.uniform(0.5, 1.5))
 
     if last_err is not None:
         raise last_err
-    raise RuntimeError(f"download failed: {url} err=unknown")
+    raise RuntimeError(f"download failed: {url}")
 
 
 def build_metadata(
@@ -340,7 +359,8 @@ def main():
                         photo_page = f"https://www.flickr.com/photos/{owner}/{photo_id}/"
                         if not url:
                             # 兜底：getSizes 再查一次最大图
-                            time.sleep(cfg["download"]["sleep_sec"])
+                            base = float(cfg["download"]["sleep_sec"])
+                            time.sleep(base + random.uniform(0, base * 0.5))
                             try:
                                 url = get_sizes_best(api_key, photo_id, ua)
                             except requests.Timeout as e:
@@ -379,7 +399,8 @@ def main():
                         if not url:
                             continue
 
-                        time.sleep(cfg["download"]["sleep_sec"])
+                        base = float(cfg["download"]["sleep_sec"])
+                        time.sleep(base + random.uniform(0, base * 0.5))
                         b = None
                         try:
                             b = download(
