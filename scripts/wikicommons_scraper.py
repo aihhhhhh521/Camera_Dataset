@@ -682,9 +682,9 @@ def main() -> None:
 
                 return {"outcome": "accepted", "downloaded": 1, "filter_passed": True, "accepted": True}
 
-            def process_deferred_queue() -> int:
+            def process_deferred_queue() -> Dict[str, int]:
                 if not deferred_urls or saved >= target:
-                    return 0
+                    return {"ready": 0, "downloaded": 0, "filter_passed": 0, "accepted": 0}
                 now_ts = time.time()
                 ready, pending = [], []
                 for item in deferred_urls:
@@ -695,6 +695,11 @@ def main() -> None:
                 deferred_urls.clear()
                 deferred_urls.extend(pending)
 
+                with state_lock:
+                    saved_before = saved
+
+                downloaded = 0
+                filter_passed = 0
                 accepted = 0
                 for item in ready:
                     if saved >= target:
@@ -702,12 +707,30 @@ def main() -> None:
                         continue
                     item["attempt_count"] += 1
                     res = handle_download_candidate(item, from_deferred=True)
+                    downloaded += int(res["downloaded"] > 0)
                     if res["filter_passed"]:
-                        cumulative_stats["filter_passed"] += 1
+                        filter_passed += 1
                     if res["accepted"]:
-                        cumulative_stats["accepted"] += 1
-                    accepted += 1
-                return accepted
+                        accepted += 1
+
+                with state_lock:
+                    accepted_from_saved = max(0, saved - saved_before)
+
+                print(
+                    f"[Wikicommons][{cat}] deferred_stats "
+                    f"ready={len(ready)} accepted_true={accepted} accepted_saved_delta={accepted_from_saved}"
+                )
+                return {
+                    "ready": len(ready),
+                    "downloaded": downloaded,
+                    "filter_passed": filter_passed,
+                    "accepted": accepted_from_saved,
+                }
+
+            def apply_stage_summary(stats: Dict[str, int]) -> None:
+                cumulative_stats["downloaded"] += stats["downloaded"]
+                cumulative_stats["filter_passed"] += stats["filter_passed"]
+                cumulative_stats["accepted"] += stats["accepted"]
 
             def process_keyword_page(kw: str, gsrcontinue: Optional[str], stage: str) -> Tuple[int, Optional[str], bool]:
                 data = search_commons(
@@ -727,6 +750,9 @@ def main() -> None:
                     monitor.maybe_log(cat)
                     adapt_download_throttle()
                     return 0, None, False
+
+                with state_lock:
+                    saved_before_page = saved
 
                 page_candidates = 0
                 page_downloaded = 0
@@ -799,13 +825,19 @@ def main() -> None:
                             if res["accepted"]:
                                 page_accepted += 1
 
-                deferred_accepted = process_deferred_queue()
-                page_accepted += deferred_accepted
+                deferred_stats = process_deferred_queue()
+                page_downloaded += deferred_stats["downloaded"]
+                page_filter_passed += deferred_stats["filter_passed"]
+
+                with state_lock:
+                    page_accepted = max(0, saved - saved_before_page)
 
                 cumulative_stats["candidates"] += page_candidates
-                cumulative_stats["downloaded"] += page_downloaded
-                cumulative_stats["filter_passed"] += page_filter_passed
-                cumulative_stats["accepted"] += page_accepted
+                apply_stage_summary({
+                    "downloaded": page_downloaded,
+                    "filter_passed": page_filter_passed,
+                    "accepted": page_accepted,
+                })
 
                 next_continue = (data.get("continue") or {}).get("gsrcontinue")
                 print(
@@ -876,7 +908,9 @@ def main() -> None:
                                     break
 
                 while saved < target and deferred_urls:
-                    accepted = process_deferred_queue()
+                    deferred_stats = process_deferred_queue()
+                    apply_stage_summary(deferred_stats)
+                    accepted = deferred_stats["accepted"]
                     if accepted > 0:
                         pbar.update(accepted)
                         flush_progress()
