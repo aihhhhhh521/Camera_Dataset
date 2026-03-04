@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import html
+import json
 import math
 import random
 import re
 import time
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, TextIO, Tuple
 from urllib.parse import urlparse
 
 import requests
@@ -22,6 +23,14 @@ from utils_fs import ensure_dirs, next_id, save_image_and_metadata
 DEFAULT_API_URL = "https://commons.wikimedia.org/w/api.php"
 DEFAULT_RETRY_BASE_SEC = 0.5
 DEFAULT_RETRY_MAX_WAIT_SEC = 60.0
+
+class RetryableHTTPError(RuntimeError):
+    def __init__(self, *, url: str, status_code: int, retry_after_sec: Optional[float]) -> None:
+        super().__init__(f"retryable http status={status_code} url={url}")
+        self.url = url
+        self.status_code = status_code
+        self.retry_after_sec = retry_after_sec
+
 
 class RateLimiter:
     def __init__(self, min_interval_sec: float) -> None:
@@ -131,6 +140,7 @@ def search_commons(
         rate_limiter=rate_limiter,
         min_interval_sec=0,
         params=params,
+        max_retry_wait_sec=DEFAULT_RETRY_MAX_WAIT_SEC,
     )
     return r.json()
 
@@ -175,6 +185,7 @@ def request_with_retry(
         max_retries: int,
         rate_limiter: Optional[RateLimiter],
         min_interval_sec: float,
+        max_retry_wait_sec: float,
         params: Optional[Dict[str, Any]] = None,
 ) -> requests.Response:
     last_err: Optional[Exception] = None
@@ -189,6 +200,7 @@ def request_with_retry(
                     retry_idx=retry,
                     min_interval_sec=min_interval_sec,
                     retry_after_sec=retry_after_sec,
+                    max_wait_sec=max_retry_wait_sec,
                 )
                 jitter_sec = min(2.0, wait_sec * 0.25) * random.random()
                 effective_wait = wait_sec + jitter_sec
@@ -197,7 +209,7 @@ def request_with_retry(
                     rate_limiter.penalize(url, effective_wait)
                 else:
                     time.sleep(effective_wait)
-                last_err = RuntimeError(f"http {r.status_code}")
+                last_err = RetryableHTTPError(url=url, status_code=r.status_code, retry_after_sec=retry_after_sec)
                 continue
             r.raise_for_status()
             return r
@@ -209,9 +221,12 @@ def request_with_retry(
                 retry_idx=retry,
                 min_interval_sec=min_interval_sec,
                 retry_after_sec=None,
+                max_wait_sec=max_retry_wait_sec,
             )
             time.sleep(wait_sec)
 
+    if isinstance(last_err, RetryableHTTPError):
+        raise last_err
     raise RuntimeError(f"request failed: {url} err={last_err}")
 
 def allow_license(license_type: str, allowlist: List[str]) -> bool:
@@ -226,7 +241,7 @@ def allow_license(license_type: str, allowlist: List[str]) -> bool:
     return False
 
 
-def download(url: str, ua: str, timeout: int, max_retries: int, rate_limiter: Optional[RateLimiter], min_interval_sec: float) -> bytes:
+def download(url: str, ua: str, timeout: int, max_retries: int, rate_limiter: Optional[RateLimiter], min_interval_sec: float, max_retry_wait_sec: float) -> bytes:
     response = request_with_retry(
         url,
         ua=ua,
@@ -234,8 +249,13 @@ def download(url: str, ua: str, timeout: int, max_retries: int, rate_limiter: Op
         max_retries=max_retries,
         rate_limiter=rate_limiter,
         min_interval_sec=min_interval_sec,
+        max_retry_wait_sec=max_retry_wait_sec,
     )
     return response.content
+
+def write_jsonl(log_fh: TextIO, payload: Dict[str, Any]) -> None:
+    log_fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    log_fh.flush()
 
 
 def build_metadata(
@@ -277,6 +297,9 @@ def main() -> None:
 
     ua = cfg["download"]["user_agent"]
     min_interval_sec = float(cfg["download"].get("sleep_sec", 0))
+    max_retries_per_try = int(cfg["download"].get("max_retries_per_try", cfg["download"].get("max_retries", 2)))
+    max_total_attempts_per_url = int(cfg["download"].get("max_total_attempts_per_url", 4))
+    max_retry_wait_sec = float(cfg["download"].get("max_retry_wait_sec", DEFAULT_RETRY_MAX_WAIT_SEC))
     rate_limiter = RateLimiter(min_interval_sec)
     pf = PipelineFilter(cfg["pipeline_filter"])
 
@@ -294,103 +317,141 @@ def main() -> None:
     else:
         allowlist = wc_cfg.get("license_allowlist") or cfg["licenses"].get("allowlist_wikicommons", []) or []
 
-    for cat, spec in cfg["categories"].items():
-        target = int(spec.get("target_count", 0))
-        keywords = spec.get("keywords", [])
-        saved = 0
-        primary_saved = 0
-        secondary_saved = 0
+    log_path = Path(dataset_root) / "logs" / "wikicommons_download_retry.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if not keywords:
-            print(f"\n[Wikicommons] category={cat} has no keywords, skip.")
-            continue
+    with log_path.open("a", encoding="utf-8") as retry_log:
+        for cat, spec in cfg["categories"].items():
+            target = int(spec.get("target_count", 0))
+            keywords = spec.get("keywords", [])
+            saved = 0
+            primary_saved = 0
+            secondary_saved = 0
+            deferred_urls: List[Dict[str, Any]] = []
 
-        primary_kw = keywords[0]
-        secondary_kws = keywords[1:]
+            if not keywords:
+                print(f"\n[Wikicommons] category={cat} has no keywords, skip.")
+                continue
 
-        primary_target = min(target, math.ceil(target * primary_ratio))
-        secondary_target = target - primary_target
+            primary_kw = keywords[0]
+            secondary_kws = keywords[1:]
 
-        print(
-            f"\n[Wikicommons] category={cat} target={target} "
-            f"primary_kw={primary_kw} secondary_kws={secondary_kws} "
-            f"primary_target={primary_target} secondary_target={secondary_target} "
-            f"secondary_mode={secondary_mode}"
-        )
+            primary_target = min(target, math.ceil(target * primary_ratio))
+            secondary_target = target - primary_target
 
-        def process_keyword_page(kw: str, gsrcontinue: Optional[str], stage: str) -> Tuple[int, Optional[str], bool]:
-            nonlocal saved, primary_saved, secondary_saved
-
-            data = search_commons(
-                api_url=api_url,
-                keyword=kw,
-                continue_token=gsrcontinue,
-                per_page=per_page,
-                ua=ua,
-                rate_limiter=rate_limiter,
+            print(
+                f"\n[Wikicommons] category={cat} target={target} "
+                f"primary_kw={primary_kw} secondary_kws={secondary_kws} "
+                f"primary_target={primary_target} secondary_target={secondary_target} "
+                f"secondary_mode={secondary_mode}"
             )
-            pages = (data.get("query") or {}).get("pages") or {}
-            if not pages:
-                print(
-                    f"[Wikicommons][{cat}:{kw}][{stage}] page_stats candidates=0 downloaded=0 filter_passed=0 accepted=0")
-                return 0, None, False
 
-            page_candidates = 0
-            page_downloaded = 0
-            page_filter_passed = 0
-            page_accepted = 0
+            def handle_download_candidate(candidate: Dict[str, Any], from_deferred: bool) -> Tuple[str, int]:
+                nonlocal saved, primary_saved, secondary_saved
 
-            for _, page in pages.items():
                 if saved >= target:
-                    break
+                    return "skip", 0
 
-                imageinfo_list = page.get("imageinfo") or []
-                if not imageinfo_list:
-                    continue
-
-                imageinfo = imageinfo_list[0]
-                mime = str(imageinfo.get("mime") or "")
-                if not mime.startswith("image/"):
-                    continue
-                page_candidates += 1
-
-                img_url = imageinfo.get("url")
-                source_page_url = imageinfo.get("descriptionurl") or page.get("fullurl") or ""
-                if not img_url:
-                    continue
-
-                license_type, license_url = extract_license_fields(imageinfo)
-                if not allow_license(license_type, allowlist):
-                    continue
+                img_url = candidate["img_url"]
+                kw = candidate["kw"]
+                stage = candidate["stage"]
 
                 try:
                     b = download(
                         img_url,
                         ua=ua,
                         timeout=int(cfg["download"]["timeout_sec"]),
-                        max_retries=int(cfg["download"]["max_retries"]),
+                        max_retries=max_retries_per_try,
                         rate_limiter=rate_limiter,
                         min_interval_sec=min_interval_sec,
+                        max_retry_wait_sec=max_retry_wait_sec,
                     )
-                    page_downloaded += 1
+                except RetryableHTTPError as e:
+                    if candidate["attempt_count"] >= max_total_attempts_per_url:
+                        write_jsonl(retry_log, {
+                            "event": "download_final_drop",
+                            "category": cat,
+                            "keyword": kw,
+                            "stage": stage,
+                            "url": img_url,
+                            "status_code": e.status_code,
+                            "attempt_count": candidate["attempt_count"],
+                            "accum_wait_sec": round(candidate["accum_wait_sec"], 3),
+                            "result": "dropped_max_attempts",
+                        })
+                        return "drop", 0
+
+                    retry_wait = compute_retry_wait(
+                        retry_idx=max(0, candidate["attempt_count"] - 1),
+                        min_interval_sec=min_interval_sec,
+                        retry_after_sec=e.retry_after_sec,
+                        max_wait_sec=max_retry_wait_sec,
+                    )
+                    candidate["next_retry_ts"] = time.time() + retry_wait
+                    candidate["accum_wait_sec"] += retry_wait
+                    candidate["last_status_code"] = e.status_code
+                    deferred_urls.append(candidate)
+                    write_jsonl(retry_log, {
+                        "event": "download_deferred",
+                        "category": cat,
+                        "keyword": kw,
+                        "stage": stage,
+                        "url": img_url,
+                        "status_code": e.status_code,
+                        "attempt_count": candidate["attempt_count"],
+                        "next_retry_ts": round(candidate["next_retry_ts"], 3),
+                        "accum_wait_sec": round(candidate["accum_wait_sec"], 3),
+                        "result": "queued",
+                        "from_deferred": from_deferred,
+                    })
+                    return "deferred", 0
                 except Exception:
-                    continue
+                    write_jsonl(retry_log, {
+                        "event": "download_non_retryable_error",
+                        "category": cat,
+                        "keyword": kw,
+                        "stage": stage,
+                        "url": img_url,
+                        "status_code": None,
+                        "attempt_count": candidate["attempt_count"],
+                        "accum_wait_sec": round(candidate["accum_wait_sec"], 3),
+                        "result": "skipped_non_retryable",
+                    })
+                    return "skip", 0
 
                 s256 = sha256_bytes(b)
                 if has_sha256(dataset_root, s256):
-                    continue
+                    write_jsonl(retry_log, {
+                        "event": "download_duplicate",
+                        "category": cat,
+                        "keyword": kw,
+                        "stage": stage,
+                        "url": img_url,
+                        "status_code": 200,
+                        "attempt_count": candidate["attempt_count"],
+                        "accum_wait_sec": round(candidate["accum_wait_sec"], 3),
+                        "result": "duplicate",
+                    })
+                    return "skip", 1
 
                 ok, metrics, reject_reason = pf.validate(b)
                 if not ok:
                     print(f"[Wikicommons][{cat}:{kw}][{stage}] reject reason={reject_reason}")
-                    continue
-                page_filter_passed += 1
+                    write_jsonl(retry_log, {
+                        "event": "download_rejected",
+                        "category": cat,
+                        "keyword": kw,
+                        "stage": stage,
+                        "url": img_url,
+                        "status_code": 200,
+                        "attempt_count": candidate["attempt_count"],
+                        "accum_wait_sec": round(candidate["accum_wait_sec"], 3),
+                        "result": f"rejected:{reject_reason}",
+                    })
+                    return "skip", 1
 
                 image_id = next_id(dataset_root, prefixes["wikicommons"], digits)
                 exif_data = exif_extract(b)
-
-                ext = imageinfo.get("extmetadata") or {}
-                author = clean_text((ext.get("Artist") or {}).get("value"))
 
                 h = int(metrics.get("H", 0))
                 w = int(metrics.get("W", 0))
@@ -398,10 +459,10 @@ def main() -> None:
                     image_id=image_id,
                     category=cat,
                     original_url=img_url,
-                    source_page_url=source_page_url,
-                    author=author,
-                    license_type=license_type,
-                    license_url=license_url,
+                    source_page_url=candidate["source_page_url"],
+                    author=candidate["author"],
+                    license_type=candidate["license_type"],
+                    license_url=candidate["license_url"],
                     search_keyword=kw,
                     resolution_hw=(h, w),
                     exif_data=exif_data,
@@ -412,70 +473,191 @@ def main() -> None:
                 add_sha256(dataset_root, s256, image_id, "wikicommons")
 
                 saved += 1
-                page_accepted += 1
                 if stage == "primary":
                     primary_saved += 1
                 else:
                     secondary_saved += 1
 
-            print(
-                f"[Wikicommons][{cat}:{kw}][{stage}] page_stats "
-                f"candidates={page_candidates} downloaded={page_downloaded} "
-                f"filter_passed={page_filter_passed} accepted={page_accepted}"
-            )
+                write_jsonl(retry_log, {
+                    "event": "download_success",
+                    "category": cat,
+                    "keyword": kw,
+                    "stage": stage,
+                    "url": img_url,
+                    "status_code": 200,
+                    "attempt_count": candidate["attempt_count"],
+                    "accum_wait_sec": round(candidate["accum_wait_sec"], 3),
+                    "result": "saved",
+                })
+                return "accepted", 1
 
-            next_continue = (data.get("continue") or {}).get("gsrcontinue")
-            return page_accepted, next_continue, True
+            def process_deferred_queue() -> int:
+                if not deferred_urls or saved >= target:
+                    return 0
+                now_ts = time.time()
+                ready, pending = [], []
+                for item in deferred_urls:
+                    if item.get("next_retry_ts", 0.0) <= now_ts:
+                        ready.append(item)
+                    else:
+                        pending.append(item)
+                deferred_urls.clear()
+                deferred_urls.extend(pending)
 
-        with tqdm(total=target, initial=saved, desc=f"WCM {cat}", unit="img") as pbar:
-            # Phase 1: primary keyword
-            primary_continue: Optional[str] = None
-            while saved < primary_target:
-                accepted, primary_continue, has_pages = process_keyword_page(primary_kw, primary_continue, "primary")
-                if accepted > 0:
-                    pbar.update(accepted)
-                if not has_pages or not primary_continue:
-                    break
+                accepted_count = 0
+                for item in ready:
+                    if saved >= target:
+                        deferred_urls.append(item)
+                        continue
+                    item["attempt_count"] += 1
+                    outcome, downloaded = handle_download_candidate(item, from_deferred=True)
+                    if outcome == "accepted":
+                        accepted_count += 1
+                return accepted_count
 
-            # Phase 2: secondary keywords in round-robin
-            if saved < target and secondary_kws:
-                if secondary_mode != "round_robin":
-                    print(f"[Wikicommons] unsupported secondary_mode={secondary_mode}, fallback to round_robin")
-                gsrcontinue_map: Dict[str, Optional[str]] = {kw: None for kw in secondary_kws}
-                exhausted_kws = set()
+            def process_keyword_page(kw: str, gsrcontinue: Optional[str], stage: str) -> Tuple[
+                int, Optional[str], bool]:
+                data = search_commons(
+                    api_url=api_url,
+                    keyword=kw,
+                    continue_token=gsrcontinue,
+                    per_page=per_page,
+                    ua=ua,
+                    rate_limiter=rate_limiter,
+                )
+                pages = (data.get("query") or {}).get("pages") or {}
+                if not pages:
+                    print(
+                        f"[Wikicommons][{cat}:{kw}][{stage}] page_stats candidates=0 downloaded=0 filter_passed=0 accepted=0")
+                    return 0, None, False
 
-                while saved < target and len(exhausted_kws) < len(secondary_kws):
-                    progressed = False
-                    for kw in secondary_kws:
-                        if saved >= target:
+                page_candidates = 0
+                page_attempted = 0
+                page_accepted = 0
+
+                for _, page in pages.items():
+                    if saved >= target:
+                        break
+
+                    imageinfo_list = page.get("imageinfo") or []
+                    if not imageinfo_list:
+                        continue
+
+                    imageinfo = imageinfo_list[0]
+                    mime = str(imageinfo.get("mime") or "")
+                    if not mime.startswith("image/"):
+                        continue
+                    page_candidates += 1
+
+                    img_url = imageinfo.get("url")
+                    source_page_url = imageinfo.get("descriptionurl") or page.get("fullurl") or ""
+                    if not img_url:
+                        continue
+
+                    license_type, license_url = extract_license_fields(imageinfo)
+                    if not allow_license(license_type, allowlist):
+                        continue
+
+                    ext = imageinfo.get("extmetadata") or {}
+                    author = clean_text((ext.get("Artist") or {}).get("value"))
+
+                    candidate = {
+                        "img_url": img_url,
+                        "source_page_url": source_page_url,
+                        "license_type": license_type,
+                        "license_url": license_url,
+                        "author": author,
+                        "kw": kw,
+                        "stage": stage,
+                        "attempt_count": 1,
+                        "next_retry_ts": 0.0,
+                        "accum_wait_sec": 0.0,
+                        "last_status_code": None,
+                    }
+                    outcome, downloaded = handle_download_candidate(candidate, from_deferred=False)
+                    if downloaded > 0:
+                        page_attempted += 1
+                    if outcome == "accepted":
+                        page_accepted += 1
+
+                deferred_accepted = process_deferred_queue()
+                page_accepted += deferred_accepted
+
+                print(
+                    f"[Wikicommons][{cat}:{kw}][{stage}] page_stats "
+                    f"candidates={page_candidates} downloaded={page_attempted} "
+                    f"accepted={page_accepted} deferred_pending={len(deferred_urls)}"
+                )
+
+                next_continue = (data.get("continue") or {}).get("gsrcontinue")
+                return page_accepted, next_continue, True
+
+            with tqdm(total=target, initial=saved, desc=f"WCM {cat}", unit="img") as pbar:
+                primary_continue: Optional[str] = None
+                while saved < primary_target:
+                    accepted, primary_continue, has_pages = process_keyword_page(primary_kw, primary_continue, "primary")
+                    if accepted > 0:
+                        pbar.update(accepted)
+                    if not has_pages or not primary_continue:
+                        break
+
+                if saved < target and secondary_kws:
+                    if secondary_mode != "round_robin":
+                        print(f"[Wikicommons] unsupported secondary_mode={secondary_mode}, fallback to round_robin")
+                    gsrcontinue_map: Dict[str, Optional[str]] = {kw: None for kw in secondary_kws}
+                    exhausted_kws = set()
+
+                    while saved < target and len(exhausted_kws) < len(secondary_kws):
+                        for kw in secondary_kws:
+                            if saved >= target:
+                                break
+                            if kw in exhausted_kws:
+                                continue
+
+                            accepted, next_continue, has_pages = process_keyword_page(
+                                kw,
+                                gsrcontinue_map.get(kw),
+                                "secondary",
+                            )
+
+                            if accepted > 0:
+                                pbar.update(accepted)
+
+                            if not has_pages or not next_continue:
+                                exhausted_kws.add(kw)
+                            else:
+                                gsrcontinue_map[kw] = next_continue
+
+                            print(
+                                f"[Wikicommons][{cat}] stage_summary "
+                                f"primary_saved={primary_saved}/{primary_target} "
+                                f"secondary_saved={secondary_saved}/{secondary_target} total_saved={saved}/{target} "
+                                f"deferred_pending={len(deferred_urls)}"
+                            )
+
+                while saved < target and deferred_urls:
+                    accepted = process_deferred_queue()
+                    if accepted > 0:
+                        pbar.update(accepted)
+                    if accepted == 0:
+                        next_retry_ts = min(item.get("next_retry_ts", time.time()) for item in deferred_urls)
+                        sleep_sec = max(0.0, min(max_retry_wait_sec, next_retry_ts - time.time()))
+                        if sleep_sec <= 0:
                             break
-                        if kw in exhausted_kws:
-                            continue
+                        time.sleep(sleep_sec)
 
-                        accepted, next_continue, has_pages = process_keyword_page(
-                            kw,
-                            gsrcontinue_map.get(kw),
-                            "secondary",
-                        )
-
-                        if accepted > 0:
-                            pbar.update(accepted)
-                            progressed = True
-
-                        if not has_pages or not next_continue:
-                            exhausted_kws.add(kw)
-                        else:
-                            gsrcontinue_map[kw] = next_continue
-
-                        if not progressed and len(exhausted_kws) < len(secondary_kws):
-                            # 轮询一圈无入库，继续翻页尝试，直到关键词耗尽或 target 达成
-                            continue
-
-                        print(
-                            f"[Wikicommons][{cat}] stage_summary "
-                            f"primary_saved={primary_saved}/{primary_target} "
-                            f"secondary_saved={secondary_saved}/{secondary_target} total_saved={saved}/{target}"
-                        )
+                        for item in deferred_urls:
+                            write_jsonl(retry_log, {
+                                "event": "download_final_drop",
+                                "category": cat,
+                                "keyword": item["kw"],
+                                "stage": item["stage"],
+                                "url": item["img_url"],
+                                "status_code": item.get("last_status_code"),
+                                "attempt_count": item["attempt_count"],
+                                "accum_wait_sec": round(item["accum_wait_sec"], 3),
+                                "result": "dropped_unfinished",
+                            })
 
     print("\n[Wikicommons] done.")
 

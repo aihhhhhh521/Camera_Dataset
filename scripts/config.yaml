@@ -9,7 +9,9 @@ naming:
 
 download:
   timeout_sec: 30
-  max_retries: 2
+  max_retries_per_try: 2
+  max_total_attempts_per_url: 4
+  max_retry_wait_sec: 60
   sleep_sec: 6.0       # 礼貌爬取（每次请求间隔）
   user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 CameraPoseDatasetBot/1.0 (+research; CC-only)"
   headers_profile: "browser_like"   # minimal / browser_like
