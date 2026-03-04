@@ -6,6 +6,7 @@ import math
 import random
 import re
 import time
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TextIO, Tuple
@@ -257,6 +258,48 @@ def write_jsonl(log_fh: TextIO, payload: Dict[str, Any]) -> None:
     log_fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
     log_fh.flush()
 
+def load_progress(progress_path: Path) -> Dict[str, Any]:
+    if not progress_path.exists():
+        return {}
+    try:
+        with progress_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_progress(progress_path: Path, progress: Dict[str, Any]) -> None:
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    with progress_path.open("w", encoding="utf-8") as f:
+        json.dump(progress, f, ensure_ascii=False, indent=2)
+
+
+def count_existing_wcm_images(dataset_root: str, category: str) -> int:
+    cat_dir = Path(dataset_root) / "raw_images" / category
+    if not cat_dir.exists():
+        return 0
+    return sum(1 for p in cat_dir.glob("WCM_*") if p.is_file())
+
+
+def build_backfill_keywords(category: str, keywords: List[str]) -> List[str]:
+    category_term = category.replace("_", " ").strip()
+    pool = list(keywords)
+    if category_term:
+        pool.extend([category_term, f"{category_term} photography", f"{category_term} photo"])
+
+    expanded: List[str] = []
+    seen = set()
+    for kw in pool:
+        kw_norm = str(kw).strip()
+        if not kw_norm:
+            continue
+        if kw_norm.lower() in seen:
+            continue
+        seen.add(kw_norm.lower())
+        expanded.append(kw_norm)
+    return expanded
+
 
 def build_metadata(
     *,
@@ -312,6 +355,8 @@ def main() -> None:
     primary_ratio = float(wc_cfg.get("primary_ratio", 0.7))
     primary_ratio = max(0.0, min(1.0, primary_ratio))
     secondary_mode = str(wc_cfg.get("secondary_mode", "round_robin")).strip().lower()
+    stop_when_exhausted = bool(wc_cfg.get("stop_when_exhausted", True))
+    allow_cross_keyword_backfill = bool(wc_cfg.get("allow_cross_keyword_backfill", False))
     if cfg["licenses"].get("mode") == "cc0_only":
         allowlist = ["cc0", "public domain", "pdm"]
     else:
@@ -320,18 +365,34 @@ def main() -> None:
     log_path = Path(dataset_root) / "logs" / "wikicommons_download_retry.jsonl"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
+    progress_path = Path(__file__).parent / "logs" / "wikicommons_progress.json"
+    progress = load_progress(progress_path)
+
     with log_path.open("a", encoding="utf-8") as retry_log:
         for cat, spec in cfg["categories"].items():
             target = int(spec.get("target_count", 0))
             keywords = spec.get("keywords", [])
-            saved = 0
-            primary_saved = 0
-            secondary_saved = 0
-            deferred_urls: List[Dict[str, Any]] = []
 
             if not keywords:
                 print(f"\n[Wikicommons] category={cat} has no keywords, skip.")
                 continue
+
+            cat_progress = progress.get(cat, {}) if isinstance(progress.get(cat, {}), dict) else {}
+            saved = int(cat_progress.get("saved_count", 0) or 0)
+            existing_saved = count_existing_wcm_images(dataset_root, cat)
+            if existing_saved > saved:
+                saved = existing_saved
+
+            primary_saved = int(cat_progress.get("primary_saved", 0) or 0)
+            secondary_saved = int(cat_progress.get("secondary_saved", 0) or 0)
+            stats = cat_progress.get("stats", {}) if isinstance(cat_progress.get("stats", {}), dict) else {}
+            cumulative_stats = {
+                "candidates": int(stats.get("candidates", 0) or 0),
+                "downloaded": int(stats.get("downloaded", 0) or 0),
+                "filter_passed": int(stats.get("filter_passed", 0) or 0),
+                "accepted": int(stats.get("accepted", 0) or 0),
+            }
+            deferred_urls: List[Dict[str, Any]] = []
 
             primary_kw = keywords[0]
             secondary_kws = keywords[1:]
@@ -339,18 +400,40 @@ def main() -> None:
             primary_target = min(target, math.ceil(target * primary_ratio))
             secondary_target = target - primary_target
 
+            primary_continue: Optional[str] = cat_progress.get("primary_continue")
+            secondary_continue_map: Dict[str, Optional[str]] = {
+                kw: token
+                for kw, token in (cat_progress.get("secondary_continue_map") or {}).items()
+                if isinstance(kw, str)
+            }
+            exhausted_kws = set(cat_progress.get("exhausted_keywords") or [])
+
             print(
-                f"\n[Wikicommons] category={cat} target={target} "
+                f"\n[Wikicommons] category={cat} target={target} saved_init={saved} existing_saved={existing_saved} "
                 f"primary_kw={primary_kw} secondary_kws={secondary_kws} "
                 f"primary_target={primary_target} secondary_target={secondary_target} "
-                f"secondary_mode={secondary_mode}"
+                f"secondary_mode={secondary_mode} stop_when_exhausted={stop_when_exhausted} "
+                f"allow_cross_keyword_backfill={allow_cross_keyword_backfill}"
             )
 
-            def handle_download_candidate(candidate: Dict[str, Any], from_deferred: bool) -> Tuple[str, int]:
+            def flush_progress() -> None:
+                progress[cat] = {
+                    "saved_count": saved,
+                    "primary_saved": primary_saved,
+                    "secondary_saved": secondary_saved,
+                    "primary_continue": primary_continue,
+                    "secondary_continue_map": secondary_continue_map,
+                    "exhausted_keywords": sorted(exhausted_kws),
+                    "stats": cumulative_stats,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+                save_progress(progress_path, progress)
+
+            def handle_download_candidate(candidate: Dict[str, Any], from_deferred: bool) -> Tuple[str, int, bool]:
                 nonlocal saved, primary_saved, secondary_saved
 
                 if saved >= target:
-                    return "skip", 0
+                    return "skip", 0, False
 
                 img_url = candidate["img_url"]
                 kw = candidate["kw"]
@@ -379,7 +462,7 @@ def main() -> None:
                             "accum_wait_sec": round(candidate["accum_wait_sec"], 3),
                             "result": "dropped_max_attempts",
                         })
-                        return "drop", 0
+                        return "drop", 0, False
 
                     retry_wait = compute_retry_wait(
                         retry_idx=max(0, candidate["attempt_count"] - 1),
@@ -404,7 +487,7 @@ def main() -> None:
                         "result": "queued",
                         "from_deferred": from_deferred,
                     })
-                    return "deferred", 0
+                    return "deferred", 0, False
                 except Exception:
                     write_jsonl(retry_log, {
                         "event": "download_non_retryable_error",
@@ -417,7 +500,7 @@ def main() -> None:
                         "accum_wait_sec": round(candidate["accum_wait_sec"], 3),
                         "result": "skipped_non_retryable",
                     })
-                    return "skip", 0
+                    return "skip", 0, False
 
                 s256 = sha256_bytes(b)
                 if has_sha256(dataset_root, s256):
@@ -432,7 +515,7 @@ def main() -> None:
                         "accum_wait_sec": round(candidate["accum_wait_sec"], 3),
                         "result": "duplicate",
                     })
-                    return "skip", 1
+                    return "skip", 1, False
 
                 ok, metrics, reject_reason = pf.validate(b)
                 if not ok:
@@ -448,7 +531,7 @@ def main() -> None:
                         "accum_wait_sec": round(candidate["accum_wait_sec"], 3),
                         "result": f"rejected:{reject_reason}",
                     })
-                    return "skip", 1
+                    return "skip", 1, False
 
                 image_id = next_id(dataset_root, prefixes["wikicommons"], digits)
                 exif_data = exif_extract(b)
@@ -489,7 +572,7 @@ def main() -> None:
                     "accum_wait_sec": round(candidate["accum_wait_sec"], 3),
                     "result": "saved",
                 })
-                return "accepted", 1
+                return "accepted", 1, True
 
             def process_deferred_queue() -> int:
                 if not deferred_urls or saved >= target:
@@ -510,13 +593,15 @@ def main() -> None:
                         deferred_urls.append(item)
                         continue
                     item["attempt_count"] += 1
-                    outcome, downloaded = handle_download_candidate(item, from_deferred=True)
+                    outcome, _, filter_passed = handle_download_candidate(item, from_deferred=True)
+                    if filter_passed:
+                        cumulative_stats["filter_passed"] += 1
                     if outcome == "accepted":
                         accepted_count += 1
+                        cumulative_stats["accepted"] += 1
                 return accepted_count
 
-            def process_keyword_page(kw: str, gsrcontinue: Optional[str], stage: str) -> Tuple[
-                int, Optional[str], bool]:
+            def process_keyword_page(kw: str, gsrcontinue: Optional[str], stage: str) -> Tuple[int, Optional[str], bool]:
                 data = search_commons(
                     api_url=api_url,
                     keyword=kw,
@@ -529,10 +614,12 @@ def main() -> None:
                 if not pages:
                     print(
                         f"[Wikicommons][{cat}:{kw}][{stage}] page_stats candidates=0 downloaded=0 filter_passed=0 accepted=0")
+                    flush_progress()
                     return 0, None, False
 
                 page_candidates = 0
-                page_attempted = 0
+                page_downloaded = 0
+                page_filter_passed = 0
                 page_accepted = 0
 
                 for _, page in pages.items():
@@ -574,26 +661,38 @@ def main() -> None:
                         "accum_wait_sec": 0.0,
                         "last_status_code": None,
                     }
-                    outcome, downloaded = handle_download_candidate(candidate, from_deferred=False)
+                    outcome, downloaded, filter_passed = handle_download_candidate(candidate, from_deferred=False)
                     if downloaded > 0:
-                        page_attempted += 1
+                        page_downloaded += 1
+                        if filter_passed:
+                            page_filter_passed += 1
                     if outcome == "accepted":
                         page_accepted += 1
 
                 deferred_accepted = process_deferred_queue()
                 page_accepted += deferred_accepted
 
+                cumulative_stats["candidates"] += page_candidates
+                cumulative_stats["downloaded"] += page_downloaded
+                cumulative_stats["filter_passed"] += page_filter_passed
+                cumulative_stats["accepted"] += page_accepted
+
                 print(
                     f"[Wikicommons][{cat}:{kw}][{stage}] page_stats "
-                    f"candidates={page_candidates} downloaded={page_attempted} "
-                    f"accepted={page_accepted} deferred_pending={len(deferred_urls)}"
+                    f"candidates={page_candidates} downloaded={page_downloaded} "
+                    f"filter_passed={page_filter_passed} accepted={page_accepted} deferred_pending={len(deferred_urls)}"
+                )
+                print(
+                    f"[Wikicommons][{cat}] cumulative_stats "
+                    f"candidates={cumulative_stats['candidates']} downloaded={cumulative_stats['downloaded']} "
+                    f"filter_passed={cumulative_stats['filter_passed']} accepted={cumulative_stats['accepted']}"
                 )
 
                 next_continue = (data.get("continue") or {}).get("gsrcontinue")
+                flush_progress()
                 return page_accepted, next_continue, True
 
-            with tqdm(total=target, initial=saved, desc=f"WCM {cat}", unit="img") as pbar:
-                primary_continue: Optional[str] = None
+            with tqdm(total=target, initial=min(saved, target), desc=f"WCM {cat}", unit="img") as pbar:
                 while saved < primary_target:
                     accepted, primary_continue, has_pages = process_keyword_page(primary_kw, primary_continue, "primary")
                     if accepted > 0:
@@ -604,8 +703,12 @@ def main() -> None:
                 if saved < target and secondary_kws:
                     if secondary_mode != "round_robin":
                         print(f"[Wikicommons] unsupported secondary_mode={secondary_mode}, fallback to round_robin")
-                    gsrcontinue_map: Dict[str, Optional[str]] = {kw: None for kw in secondary_kws}
-                    exhausted_kws = set()
+                    if not secondary_continue_map:
+                        secondary_continue_map = {kw: None for kw in secondary_kws}
+                    else:
+                        for kw in secondary_kws:
+                            secondary_continue_map.setdefault(kw, None)
+                    exhausted_kws.intersection_update(set(secondary_kws))
 
                     while saved < target and len(exhausted_kws) < len(secondary_kws):
                         for kw in secondary_kws:
@@ -616,7 +719,7 @@ def main() -> None:
 
                             accepted, next_continue, has_pages = process_keyword_page(
                                 kw,
-                                gsrcontinue_map.get(kw),
+                                secondary_continue_map.get(kw),
                                 "secondary",
                             )
 
@@ -626,7 +729,7 @@ def main() -> None:
                             if not has_pages or not next_continue:
                                 exhausted_kws.add(kw)
                             else:
-                                gsrcontinue_map[kw] = next_continue
+                                secondary_continue_map[kw] = next_continue
 
                             print(
                                 f"[Wikicommons][{cat}] stage_summary "
@@ -634,11 +737,38 @@ def main() -> None:
                                 f"secondary_saved={secondary_saved}/{secondary_target} total_saved={saved}/{target} "
                                 f"deferred_pending={len(deferred_urls)}"
                             )
+                            flush_progress()
+
+                    if (
+                            saved < target
+                            and allow_cross_keyword_backfill
+                            and (not stop_when_exhausted or len(exhausted_kws) >= len(secondary_kws))
+                    ):
+                        backfill_keywords = [kw for kw in build_backfill_keywords(cat, keywords) if kw not in set(keywords)]
+                        if backfill_keywords:
+                            print(f"[Wikicommons][{cat}] start backfill keywords={backfill_keywords}")
+                        for backfill_kw in backfill_keywords:
+                            if saved >= target:
+                                break
+                            if stop_when_exhausted and backfill_kw in exhausted_kws:
+                                continue
+                            continue_token: Optional[str] = None
+                            while saved < target:
+                                accepted, continue_token, has_pages = process_keyword_page(backfill_kw, continue_token,"secondary")
+                                if accepted > 0:
+                                    pbar.update(accepted)
+                                if not has_pages or not continue_token:
+                                    exhausted_kws.add(backfill_kw)
+                                    break
+                                if stop_when_exhausted and continue_token is None:
+                                    exhausted_kws.add(backfill_kw)
+                                    break
 
                 while saved < target and deferred_urls:
                     accepted = process_deferred_queue()
                     if accepted > 0:
                         pbar.update(accepted)
+                        flush_progress()
                     if accepted == 0:
                         next_retry_ts = min(item.get("next_retry_ts", time.time()) for item in deferred_urls)
                         sleep_sec = max(0.0, min(max_retry_wait_sec, next_retry_ts - time.time()))
@@ -646,18 +776,19 @@ def main() -> None:
                             break
                         time.sleep(sleep_sec)
 
-                        for item in deferred_urls:
-                            write_jsonl(retry_log, {
-                                "event": "download_final_drop",
-                                "category": cat,
-                                "keyword": item["kw"],
-                                "stage": item["stage"],
-                                "url": item["img_url"],
-                                "status_code": item.get("last_status_code"),
-                                "attempt_count": item["attempt_count"],
-                                "accum_wait_sec": round(item["accum_wait_sec"], 3),
-                                "result": "dropped_unfinished",
-                            })
+                for item in deferred_urls:
+                    write_jsonl(retry_log, {
+                        "event": "download_final_drop",
+                        "category": cat,
+                        "keyword": item["kw"],
+                        "stage": item["stage"],
+                        "url": item["img_url"],
+                        "status_code": item.get("last_status_code"),
+                        "attempt_count": item["attempt_count"],
+                        "accum_wait_sec": round(item["accum_wait_sec"], 3),
+                        "result": "dropped_unfinished",
+                    })
+                flush_progress()
 
     print("\n[Wikicommons] done.")
 
