@@ -75,6 +75,7 @@ pipeline_filter:
   min_side: 1024
   max_aspect_ratio: 3.0
   min_filesize_kb: 40
+  max_pixels: 89478485
 
   # 清晰度：Laplacian 方差阈值（经验值，越大越清晰）
   min_laplacian_var: 80.0

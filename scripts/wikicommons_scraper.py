@@ -380,8 +380,9 @@ def main() -> None:
                 if has_sha256(dataset_root, s256):
                     continue
 
-                ok, metrics, _ = pf.validate(b)
+                ok, metrics, reject_reason = pf.validate(b)
                 if not ok:
+                    print(f"[Wikicommons][{cat}:{kw}][{stage}] reject reason={reject_reason}")
                     continue
                 page_filter_passed += 1
 

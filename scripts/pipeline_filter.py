@@ -2,7 +2,7 @@ from __future__ import annotations
 import math
 import numpy as np
 import cv2
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from io import BytesIO
 import exifread
 import hashlib
@@ -107,8 +107,25 @@ class PipelineFilter:
         if kb < float(self.cfg.get("min_filesize_kb", 1)):
             return False, metrics, "filesize_too_small"
 
+        # 超大像素图可选提前过滤，避免昂贵解码
+        max_pixels = self.cfg.get("max_pixels")
+        if max_pixels is not None:
+            try:
+                with Image.open(BytesIO(image_bytes)) as probe:
+                    w0, h0 = probe.size
+                metrics["header_H"] = float(h0)
+                metrics["header_W"] = float(w0)
+                metrics["header_pixels"] = float(w0 * h0)
+                if (w0 * h0) > int(max_pixels):
+                    return False, metrics, "too_many_pixels"
+            except (Image.DecompressionBombError, UnidentifiedImageError, OSError):
+                return False, metrics, "decode_error_or_decompression_bomb"
+
         # 解码
-        rgb = read_image_rgb(image_bytes)
+        try:
+            rgb = read_image_rgb(image_bytes)
+        except (Image.DecompressionBombError, UnidentifiedImageError, OSError):
+            return False, metrics, "decode_error_or_decompression_bomb"
         h, w = rgb.shape[:2]
         metrics["H"] = float(h)
         metrics["W"] = float(w)
