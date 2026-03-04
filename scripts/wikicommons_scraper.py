@@ -638,27 +638,33 @@ def main() -> None:
                     return {"outcome": "skip", "downloaded": 1, "filter_passed": False, "accepted": False}
 
                 monitor.record_filter_pass()
-                image_id = next_id(dataset_root, prefixes["wikicommons"], digits)
                 exif_data = exif_extract(b)
                 h = int(metrics.get("H", 0))
                 w = int(metrics.get("W", 0))
-                md = build_metadata(
-                    image_id=image_id,
-                    category=cat,
-                    original_url=img_url,
-                    source_page_url=candidate["source_page_url"],
-                    author=candidate["author"],
-                    license_type=candidate["license_type"],
-                    license_url=candidate["license_url"],
-                    search_keyword=kw,
-                    resolution_hw=(h, w),
-                    exif_data=exif_data,
-                    pipeline_metrics=metrics,
-                )
 
                 with state_lock:
                     if has_sha256(dataset_root, s256):
                         return {"outcome": "skip", "downloaded": 1, "filter_passed": False, "accepted": False}
+
+                    image_id = next_id(dataset_root, prefixes["wikicommons"], digits)
+                    img_path = Path(dataset_root) / "raw_images" / cat / f"{image_id}.jpg"
+                    meta_path = Path(dataset_root) / "metadata" / f"{image_id}.json"
+                    if img_path.exists() or meta_path.exists():
+                        image_id = next_id(dataset_root, prefixes["wikicommons"], digits)
+
+                    md = build_metadata(
+                        image_id=image_id,
+                        category=cat,
+                        original_url=img_url,
+                        source_page_url=candidate["source_page_url"],
+                        author=candidate["author"],
+                        license_type=candidate["license_type"],
+                        license_url=candidate["license_url"],
+                        search_keyword=kw,
+                        resolution_hw=(h, w),
+                        exif_data=exif_data,
+                        pipeline_metrics=metrics,
+                    )
                     save_image_and_metadata(dataset_root, cat, image_id, b, md)
                     add_sha256(dataset_root, s256, image_id, "wikicommons")
 
