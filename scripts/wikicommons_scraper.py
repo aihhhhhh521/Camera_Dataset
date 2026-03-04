@@ -362,6 +362,47 @@ def save_progress(progress_path: Path, progress: Dict[str, Any]) -> None:
     with progress_path.open("w", encoding="utf-8") as f:
         json.dump(progress, f, ensure_ascii=False, indent=2)
 
+def serialize_deferred_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "img_url": candidate.get("img_url"),
+        "pageid": str(candidate.get("pageid")) if candidate.get("pageid") is not None else None,
+        "source_page_url": candidate.get("source_page_url", ""),
+        "license_type": candidate.get("license_type", ""),
+        "license_url": candidate.get("license_url", ""),
+        "author": candidate.get("author", ""),
+        "kw": candidate.get("kw", ""),
+        "stage": candidate.get("stage", "secondary"),
+        "attempt_count": int(candidate.get("attempt_count", 1) or 1),
+        "next_retry_ts": float(candidate.get("next_retry_ts", 0.0) or 0.0),
+        "accum_wait_sec": float(candidate.get("accum_wait_sec", 0.0) or 0.0),
+        "last_status_code": candidate.get("last_status_code"),
+    }
+
+
+def restore_deferred_candidates(raw_items: Any, *, now_ts: float) -> List[Dict[str, Any]]:
+    if not isinstance(raw_items, list):
+        return []
+
+    restored: List[Dict[str, Any]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        img_url = item.get("img_url")
+        kw = item.get("kw")
+        stage = item.get("stage")
+        if not img_url or not kw or not stage:
+            continue
+
+        candidate = serialize_deferred_candidate(item)
+        candidate["next_retry_ts"] = max(now_ts, float(candidate["next_retry_ts"]))
+        candidate["attempt_count"] = max(1, int(candidate["attempt_count"]))
+        candidate["accum_wait_sec"] = max(0.0, float(candidate["accum_wait_sec"]))
+        restored.append(candidate)
+
+    return restored
+
+
+
 
 def count_existing_wcm_images(dataset_root: str, category: str) -> int:
     cat_dir = Path(dataset_root) / "raw_images" / category
@@ -488,9 +529,16 @@ def main() -> None:
                 "filter_passed": int(stats.get("filter_passed", 0) or 0),
                 "accepted": int(stats.get("accepted", 0) or 0),
             }
-            deferred_urls: List[Dict[str, Any]] = []
+            deferred_urls: List[Dict[str, Any]] = restore_deferred_candidates(
+                cat_progress.get("deferred_urls"),
+                now_ts=time.time(),
+            )
             seen_urls: Set[str] = set(cat_progress.get("seen_urls") or [])
             seen_pageids: Set[str] = set(str(v) for v in (cat_progress.get("seen_pageids") or []))
+            in_progress_urls: Set[str] = set(item["img_url"] for item in deferred_urls if item.get("img_url"))
+            in_progress_pageids: Set[str] = set(
+                str(item["pageid"]) for item in deferred_urls if item.get("pageid") is not None
+            )
             state_lock = threading.Lock()
 
             primary_kw = keywords[0]
@@ -514,6 +562,7 @@ def main() -> None:
                 f"secondary_mode={secondary_mode} stop_when_exhausted={stop_when_exhausted} "
                 f"allow_cross_keyword_backfill={allow_cross_keyword_backfill}"
             )
+            print(f"[Wikicommons][{cat}] restored_deferred_count={len(deferred_urls)}")
 
             def flush_progress() -> None:
                 progress[cat] = {
@@ -524,11 +573,23 @@ def main() -> None:
                     "secondary_continue_map": secondary_continue_map,
                     "exhausted_keywords": sorted(exhausted_kws),
                     "stats": cumulative_stats,
+                    "deferred_urls": [serialize_deferred_candidate(item) for item in deferred_urls][-5000:],
                     "seen_urls": sorted(seen_urls)[-5000:],
                     "seen_pageids": sorted(seen_pageids)[-5000:],
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
                 save_progress(progress_path, progress)
+
+            def mark_candidate_terminal(candidate: Dict[str, Any]) -> None:
+                img_url = candidate.get("img_url")
+                pageid = candidate.get("pageid")
+                if img_url:
+                    seen_urls.add(img_url)
+                    in_progress_urls.discard(img_url)
+                if pageid is not None:
+                    pageid_str = str(pageid)
+                    seen_pageids.add(pageid_str)
+                    in_progress_pageids.discard(pageid_str)
 
             def adapt_download_throttle() -> None:
                 if monitor.requests < 5:
@@ -564,6 +625,8 @@ def main() -> None:
                     )
                 except RetryableHTTPError as e:
                     if candidate["attempt_count"] >= max_total_attempts_per_url:
+                        with state_lock:
+                            mark_candidate_terminal(candidate)
                         write_jsonl(retry_log, {
                             "event": "download_final_drop",
                             "category": cat,
@@ -603,6 +666,8 @@ def main() -> None:
                     })
                     return {"outcome": "deferred", "downloaded": 0, "filter_passed": False, "accepted": False}
                 except Exception:
+                    with state_lock:
+                        mark_candidate_terminal(candidate)
                     write_jsonl(retry_log, {
                         "event": "download_non_retryable_error",
                         "category": cat,
@@ -620,10 +685,13 @@ def main() -> None:
                 s256 = sha256_bytes(b)
                 with state_lock:
                     if has_sha256(dataset_root, s256):
+                        mark_candidate_terminal(candidate)
                         return {"outcome": "skip", "downloaded": 1, "filter_passed": False, "accepted": False}
 
                 ok, metrics, reject_reason = pf.validate(b)
                 if not ok:
+                    with state_lock:
+                        mark_candidate_terminal(candidate)
                     write_jsonl(retry_log, {
                         "event": "download_rejected",
                         "category": cat,
@@ -644,6 +712,7 @@ def main() -> None:
 
                 with state_lock:
                     if has_sha256(dataset_root, s256):
+                        mark_candidate_terminal(candidate)
                         return {"outcome": "skip", "downloaded": 1, "filter_passed": False, "accepted": False}
 
                     image_id = next_id(dataset_root, prefixes["wikicommons"], digits)
@@ -685,6 +754,7 @@ def main() -> None:
                         primary_saved += 1
                     else:
                         secondary_saved += 1
+                    mark_candidate_terminal(candidate)
 
                 return {"outcome": "accepted", "downloaded": 1, "filter_passed": True, "accepted": True}
 
@@ -780,7 +850,14 @@ def main() -> None:
                         continue
 
                     img_url = imageinfo.get("url")
-                    if not img_url or img_url in seen_urls or str(pageid) in seen_pageids:
+                    pageid_str = str(pageid)
+                    if (
+                            not img_url
+                            or img_url in seen_urls
+                            or pageid_str in seen_pageids
+                            or img_url in in_progress_urls
+                            or pageid_str in in_progress_pageids
+                    ):
                         continue
 
                     ok_meta, reason = prefilter_imageinfo(imageinfo, filter_cfg)
@@ -802,12 +879,13 @@ def main() -> None:
                     source_page_url = imageinfo.get("descriptionurl") or page.get("fullurl") or ""
                     ext = imageinfo.get("extmetadata") or {}
                     author = clean_text((ext.get("Artist") or {}).get("value"))
-                    seen_urls.add(img_url)
-                    seen_pageids.add(str(pageid))
+                    in_progress_urls.add(img_url)
+                    in_progress_pageids.add(pageid_str)
                     page_candidates += 1
 
                     pending.append({
                         "img_url": img_url,
+                        "pageid": pageid_str,
                         "source_page_url": source_page_url,
                         "license_type": license_type,
                         "license_url": license_url,
@@ -928,6 +1006,8 @@ def main() -> None:
                         time.sleep(sleep_sec)
 
                 for item in deferred_urls:
+                    with state_lock:
+                        mark_candidate_terminal(item)
                     write_jsonl(retry_log, {
                         "event": "download_final_drop",
                         "category": cat,
