@@ -10,9 +10,13 @@ naming:
 download:
   timeout_sec: 30
   max_retries_per_try: 2
-  max_total_attempts_per_url: 4
-  max_retry_wait_sec: 60
-  sleep_sec: 6.0       # 礼貌爬取（每次请求间隔）
+  max_total_attempts_per_url: 5
+  max_retry_wait_sec: 30
+  sleep_sec: 1.0       # 兼容旧字段，等价于 API 默认请求间隔
+  api_sleep_sec: 1.0
+  image_sleep_sec: 0.8
+  download_workers: 4
+  monitor_interval_sec: 60
   user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 CameraPoseDatasetBot/1.0 (+research; CC-only)"
   headers_profile: "browser_like"   # minimal / browser_like
   referer_enabled: true
@@ -82,11 +86,11 @@ pipeline_filter:
   max_pixels: 89478485
 
   # 清晰度：Laplacian 方差阈值（经验值，越大越清晰）
-  min_laplacian_var: 80.0
+  min_laplacian_var: 55.0
 
   # 构图显著性（轻量 saliency）：显著区域占比不能太小/太大（你的图里写 10%~80%）
   saliency_enabled: true
-  saliency_min_ratio: 0.10
+  saliency_min_ratio: 0.08
   saliency_max_ratio: 0.80
 
   # 可选：深度一致性（需要安装 torch/transformers 且首次会下载模型）

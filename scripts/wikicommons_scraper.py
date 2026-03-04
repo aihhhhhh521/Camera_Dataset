@@ -5,11 +5,13 @@ import json
 import math
 import random
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TextIO, Tuple
+from typing import Any, Dict, List, Optional, Set, TextIO, Tuple
 from urllib.parse import urlparse
 
 import requests
@@ -39,6 +41,11 @@ class RateLimiter:
         self._last_global = 0.0
         self._last_by_domain: Dict[str, float] = {}
         self._blocked_until_by_domain: Dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def update_min_interval(self, min_interval_sec: float) -> None:
+        with self._lock:
+            self.min_interval_sec = max(0.0, float(min_interval_sec))
 
     def _host_from_url(self, url: str) -> str:
         return urlparse(url).netloc or "global"
@@ -48,29 +55,76 @@ class RateLimiter:
             return
         host = self._host_from_url(url)
         deadline = time.monotonic() + wait_sec
-        self._blocked_until_by_domain[host] = max(self._blocked_until_by_domain.get(host, 0.0), deadline)
+        with self._lock:
+            self._blocked_until_by_domain[host] = max(self._blocked_until_by_domain.get(host, 0.0), deadline)
 
     def wait(self, url: str) -> None:
         host = self._host_from_url(url)
 
-        now = time.monotonic()
-        blocked_until = self._blocked_until_by_domain.get(host, 0.0)
-
-        wait_sec = max(0.0, blocked_until - now)
-
-        if self.min_interval_sec > 0:
-            last_domain = self._last_by_domain.get(host, 0.0)
-            wait_sec = max(
-                wait_sec,
-                self.min_interval_sec - (now - self._last_global),
-                self.min_interval_sec - (now - last_domain),
-            )
+        with self._lock:
+            now = time.monotonic()
+            blocked_until = self._blocked_until_by_domain.get(host, 0.0)
+            wait_sec = max(0.0, blocked_until - now)
+            min_interval_sec = self.min_interval_sec
+            if min_interval_sec > 0:
+                last_domain = self._last_by_domain.get(host, 0.0)
+                wait_sec = max(
+                    wait_sec,
+                    min_interval_sec - (now - self._last_global),
+                    min_interval_sec - (now - last_domain),
+                )
         if wait_sec > 0:
             time.sleep(wait_sec)
 
-        ts = time.monotonic()
-        self._last_global = ts
-        self._last_by_domain[host] = ts
+        with self._lock:
+            ts = time.monotonic()
+            self._last_global = ts
+            self._last_by_domain[host] = ts
+
+class ThroughputMonitor:
+    def __init__(self, interval_sec: float = 60.0) -> None:
+        self.interval_sec = interval_sec
+        self.window_started = time.time()
+        self.requests = 0
+        self.r429 = 0
+        self.download_attempts = 0
+        self.download_success = 0
+        self.filter_pass = 0
+
+    def record_request(self, status_code: Optional[int]) -> None:
+        self.requests += 1
+        if status_code == 429:
+            self.r429 += 1
+
+    def record_download_attempt(self) -> None:
+        self.download_attempts += 1
+
+    def record_download_success(self) -> None:
+        self.download_success += 1
+
+    def record_filter_pass(self) -> None:
+        self.filter_pass += 1
+
+    def maybe_log(self, cat: str) -> None:
+        now = time.time()
+        elapsed = now - self.window_started
+        if elapsed < self.interval_sec:
+            return
+        req_per_min = self.requests * 60.0 / max(elapsed, 1e-6)
+        ratio_429 = self.r429 / max(self.requests, 1)
+        dl_success_ratio = self.download_success / max(self.download_attempts, 1)
+        filter_pass_ratio = self.filter_pass / max(self.download_success, 1)
+        print(
+            f"[Wikicommons][{cat}] throughput/min requests={req_per_min:.1f} "
+            f"429_rate={ratio_429:.2%} download_success_rate={dl_success_ratio:.2%} "
+            f"filter_pass_rate={filter_pass_ratio:.2%}"
+        )
+        self.window_started = now
+        self.requests = 0
+        self.r429 = 0
+        self.download_attempts = 0
+        self.download_success = 0
+        self.filter_pass = 0
 
 def load_cfg() -> dict:
     cfg_path = Path(__file__).with_name("config.yaml")
@@ -117,6 +171,9 @@ def search_commons(
     per_page: int,
     ua: str,
     rate_limiter: Optional[RateLimiter],
+    max_retries: int,
+    max_retry_wait_sec: float,
+    monitor: Optional[ThroughputMonitor],
 ) -> Dict[str, Any]:
     params = {
         "action": "query",
@@ -137,11 +194,12 @@ def search_commons(
         api_url,
         ua=ua,
         timeout=30,
-        max_retries=5,
+        max_retries=max_retries,
         rate_limiter=rate_limiter,
         min_interval_sec=0,
         params=params,
-        max_retry_wait_sec=DEFAULT_RETRY_MAX_WAIT_SEC,
+        max_retry_wait_sec=max_retry_wait_sec,
+        monitor=monitor,
     )
     return r.json()
 
@@ -188,6 +246,7 @@ def request_with_retry(
         min_interval_sec: float,
         max_retry_wait_sec: float,
         params: Optional[Dict[str, Any]] = None,
+        monitor: Optional[ThroughputMonitor] = None,
 ) -> requests.Response:
     last_err: Optional[Exception] = None
     for retry in range(max_retries):
@@ -195,6 +254,8 @@ def request_with_retry(
             if rate_limiter:
                 rate_limiter.wait(url)
             r = requests.get(url, params=params, headers={"User-Agent": ua}, timeout=timeout)
+            if monitor:
+                monitor.record_request(r.status_code)
             if r.status_code == 429 or 500 <= r.status_code < 600:
                 retry_after_sec = parse_retry_after(r.headers)
                 wait_sec = compute_retry_wait(
@@ -240,6 +301,33 @@ def allow_license(license_type: str, allowlist: List[str]) -> bool:
         if token and token in normalized:
             return True
     return False
+
+def prefilter_imageinfo(imageinfo: Dict[str, Any], filter_cfg: Dict[str, Any]) -> Tuple[bool, str]:
+    width = int(imageinfo.get("width") or 0)
+    height = int(imageinfo.get("height") or 0)
+    file_size_bytes = int(imageinfo.get("size") or 0)
+
+    if width <= 0 or height <= 0:
+        return False, "invalid_size_metadata"
+
+    min_side = int(filter_cfg.get("min_side", 0))
+    if min(width, height) < min_side:
+        return False, "min_side_too_small"
+
+    max_aspect_ratio = float(filter_cfg.get("max_aspect_ratio", 999.0))
+    aspect_ratio = max(width, height) / max(1, min(width, height))
+    if aspect_ratio > max_aspect_ratio:
+        return False, "aspect_ratio_too_extreme"
+
+    min_filesize_kb = float(filter_cfg.get("min_filesize_kb", 0))
+    if file_size_bytes > 0 and (file_size_bytes / 1024.0) < min_filesize_kb:
+        return False, "filesize_too_small"
+
+    max_pixels = filter_cfg.get("max_pixels")
+    if max_pixels is not None and (width * height) > int(max_pixels):
+        return False, "too_many_pixels"
+
+    return True, ""
 
 
 def download(url: str, ua: str, timeout: int, max_retries: int, rate_limiter: Optional[RateLimiter], min_interval_sec: float, max_retry_wait_sec: float) -> bytes:
@@ -339,12 +427,18 @@ def main() -> None:
     init_db(dataset_root)
 
     ua = cfg["download"]["user_agent"]
-    min_interval_sec = float(cfg["download"].get("sleep_sec", 0))
     max_retries_per_try = int(cfg["download"].get("max_retries_per_try", cfg["download"].get("max_retries", 2)))
     max_total_attempts_per_url = int(cfg["download"].get("max_total_attempts_per_url", 4))
     max_retry_wait_sec = float(cfg["download"].get("max_retry_wait_sec", DEFAULT_RETRY_MAX_WAIT_SEC))
-    rate_limiter = RateLimiter(min_interval_sec)
+    search_sleep_sec = float(cfg["download"].get("api_sleep_sec", cfg["download"].get("sleep_sec", 1.0)))
+    download_sleep_sec = float(cfg["download"].get("image_sleep_sec", cfg["download"].get("sleep_sec", 1.0)))
+    search_rate_limiter = RateLimiter(search_sleep_sec)
+    download_rate_limiter = RateLimiter(download_sleep_sec)
+
+    download_workers = max(1, int(cfg["download"].get("download_workers", 4)))
+    monitor_interval_sec = float(cfg["download"].get("monitor_interval_sec", 60))
     pf = PipelineFilter(cfg["pipeline_filter"])
+    filter_cfg = cfg["pipeline_filter"]
 
     prefixes = cfg["naming"]["prefixes"]
     digits = int(cfg["naming"]["digits"])
@@ -352,6 +446,7 @@ def main() -> None:
     wc_cfg = cfg["wikicommons"]
     api_url = wc_cfg.get("api_url", DEFAULT_API_URL)
     per_page = int(wc_cfg.get("per_page", 50))
+    search_max_retries = int(wc_cfg.get("search_max_retries", 5))
     primary_ratio = float(wc_cfg.get("primary_ratio", 0.7))
     primary_ratio = max(0.0, min(1.0, primary_ratio))
     secondary_mode = str(wc_cfg.get("secondary_mode", "round_robin")).strip().lower()
@@ -372,6 +467,7 @@ def main() -> None:
         for cat, spec in cfg["categories"].items():
             target = int(spec.get("target_count", 0))
             keywords = spec.get("keywords", [])
+            monitor = ThroughputMonitor(interval_sec=monitor_interval_sec)
 
             if not keywords:
                 print(f"\n[Wikicommons] category={cat} has no keywords, skip.")
@@ -393,6 +489,9 @@ def main() -> None:
                 "accepted": int(stats.get("accepted", 0) or 0),
             }
             deferred_urls: List[Dict[str, Any]] = []
+            seen_urls: Set[str] = set(cat_progress.get("seen_urls") or [])
+            seen_pageids: Set[str] = set(str(v) for v in (cat_progress.get("seen_pageids") or []))
+            state_lock = threading.Lock()
 
             primary_kw = keywords[0]
             secondary_kws = keywords[1:]
@@ -425,19 +524,33 @@ def main() -> None:
                     "secondary_continue_map": secondary_continue_map,
                     "exhausted_keywords": sorted(exhausted_kws),
                     "stats": cumulative_stats,
+                    "seen_urls": sorted(seen_urls)[-5000:],
+                    "seen_pageids": sorted(seen_pageids)[-5000:],
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
                 save_progress(progress_path, progress)
 
-            def handle_download_candidate(candidate: Dict[str, Any], from_deferred: bool) -> Tuple[str, int, bool]:
+            def adapt_download_throttle() -> None:
+                if monitor.requests < 5:
+                    return
+                r429 = monitor.r429 / max(monitor.requests, 1)
+                curr = download_rate_limiter.min_interval_sec
+                if r429 > 0.15:
+                    download_rate_limiter.update_min_interval(min(curr + 0.2, 3.0))
+                elif r429 < 0.02:
+                    download_rate_limiter.update_min_interval(max(curr - 0.1, 0.3))
+
+            def handle_download_candidate(candidate: Dict[str, Any], from_deferred: bool) -> Dict[str, Any]:
                 nonlocal saved, primary_saved, secondary_saved
 
-                if saved >= target:
-                    return "skip", 0, False
+                with state_lock:
+                    if saved >= target:
+                        return {"outcome": "skip", "downloaded": 0, "filter_passed": False, "accepted": False}
 
                 img_url = candidate["img_url"]
                 kw = candidate["kw"]
                 stage = candidate["stage"]
+                monitor.record_download_attempt()
 
                 try:
                     b = download(
@@ -445,8 +558,8 @@ def main() -> None:
                         ua=ua,
                         timeout=int(cfg["download"]["timeout_sec"]),
                         max_retries=max_retries_per_try,
-                        rate_limiter=rate_limiter,
-                        min_interval_sec=min_interval_sec,
+                        rate_limiter=download_rate_limiter,
+                        min_interval_sec=download_rate_limiter.min_interval_sec,
                         max_retry_wait_sec=max_retry_wait_sec,
                     )
                 except RetryableHTTPError as e:
@@ -462,18 +575,19 @@ def main() -> None:
                             "accum_wait_sec": round(candidate["accum_wait_sec"], 3),
                             "result": "dropped_max_attempts",
                         })
-                        return "drop", 0, False
+                        return {"outcome": "drop", "downloaded": 0, "filter_passed": False, "accepted": False}
 
                     retry_wait = compute_retry_wait(
                         retry_idx=max(0, candidate["attempt_count"] - 1),
-                        min_interval_sec=min_interval_sec,
+                        min_interval_sec=download_rate_limiter.min_interval_sec,
                         retry_after_sec=e.retry_after_sec,
                         max_wait_sec=max_retry_wait_sec,
                     )
                     candidate["next_retry_ts"] = time.time() + retry_wait
                     candidate["accum_wait_sec"] += retry_wait
                     candidate["last_status_code"] = e.status_code
-                    deferred_urls.append(candidate)
+                    with state_lock:
+                        deferred_urls.append(candidate)
                     write_jsonl(retry_log, {
                         "event": "download_deferred",
                         "category": cat,
@@ -487,7 +601,7 @@ def main() -> None:
                         "result": "queued",
                         "from_deferred": from_deferred,
                     })
-                    return "deferred", 0, False
+                    return {"outcome": "deferred", "downloaded": 0, "filter_passed": False, "accepted": False}
                 except Exception:
                     write_jsonl(retry_log, {
                         "event": "download_non_retryable_error",
@@ -500,26 +614,16 @@ def main() -> None:
                         "accum_wait_sec": round(candidate["accum_wait_sec"], 3),
                         "result": "skipped_non_retryable",
                     })
-                    return "skip", 0, False
+                    return {"outcome": "skip", "downloaded": 0, "filter_passed": False, "accepted": False}
 
+                monitor.record_download_success()
                 s256 = sha256_bytes(b)
-                if has_sha256(dataset_root, s256):
-                    write_jsonl(retry_log, {
-                        "event": "download_duplicate",
-                        "category": cat,
-                        "keyword": kw,
-                        "stage": stage,
-                        "url": img_url,
-                        "status_code": 200,
-                        "attempt_count": candidate["attempt_count"],
-                        "accum_wait_sec": round(candidate["accum_wait_sec"], 3),
-                        "result": "duplicate",
-                    })
-                    return "skip", 1, False
+                with state_lock:
+                    if has_sha256(dataset_root, s256):
+                        return {"outcome": "skip", "downloaded": 1, "filter_passed": False, "accepted": False}
 
                 ok, metrics, reject_reason = pf.validate(b)
                 if not ok:
-                    print(f"[Wikicommons][{cat}:{kw}][{stage}] reject reason={reject_reason}")
                     write_jsonl(retry_log, {
                         "event": "download_rejected",
                         "category": cat,
@@ -531,11 +635,11 @@ def main() -> None:
                         "accum_wait_sec": round(candidate["accum_wait_sec"], 3),
                         "result": f"rejected:{reject_reason}",
                     })
-                    return "skip", 1, False
+                    return {"outcome": "skip", "downloaded": 1, "filter_passed": False, "accepted": False}
 
+                monitor.record_filter_pass()
                 image_id = next_id(dataset_root, prefixes["wikicommons"], digits)
                 exif_data = exif_extract(b)
-
                 h = int(metrics.get("H", 0))
                 w = int(metrics.get("W", 0))
                 md = build_metadata(
@@ -552,14 +656,11 @@ def main() -> None:
                     pipeline_metrics=metrics,
                 )
 
-                save_image_and_metadata(dataset_root, cat, image_id, b, md)
-                add_sha256(dataset_root, s256, image_id, "wikicommons")
-
-                saved += 1
-                if stage == "primary":
-                    primary_saved += 1
-                else:
-                    secondary_saved += 1
+                with state_lock:
+                    if has_sha256(dataset_root, s256):
+                        return {"outcome": "skip", "downloaded": 1, "filter_passed": False, "accepted": False}
+                    save_image_and_metadata(dataset_root, cat, image_id, b, md)
+                    add_sha256(dataset_root, s256, image_id, "wikicommons")
 
                 write_jsonl(retry_log, {
                     "event": "download_success",
@@ -572,7 +673,14 @@ def main() -> None:
                     "accum_wait_sec": round(candidate["accum_wait_sec"], 3),
                     "result": "saved",
                 })
-                return "accepted", 1, True
+                with state_lock:
+                    saved += 1
+                    if stage == "primary":
+                        primary_saved += 1
+                    else:
+                        secondary_saved += 1
+
+                return {"outcome": "accepted", "downloaded": 1, "filter_passed": True, "accepted": True}
 
             def process_deferred_queue() -> int:
                 if not deferred_urls or saved >= target:
@@ -587,19 +695,19 @@ def main() -> None:
                 deferred_urls.clear()
                 deferred_urls.extend(pending)
 
-                accepted_count = 0
+                accepted = 0
                 for item in ready:
                     if saved >= target:
                         deferred_urls.append(item)
                         continue
                     item["attempt_count"] += 1
-                    outcome, _, filter_passed = handle_download_candidate(item, from_deferred=True)
-                    if filter_passed:
+                    res = handle_download_candidate(item, from_deferred=True)
+                    if res["filter_passed"]:
                         cumulative_stats["filter_passed"] += 1
-                    if outcome == "accepted":
-                        accepted_count += 1
+                    if res["accepted"]:
                         cumulative_stats["accepted"] += 1
-                return accepted_count
+                    accepted += 1
+                return accepted
 
             def process_keyword_page(kw: str, gsrcontinue: Optional[str], stage: str) -> Tuple[int, Optional[str], bool]:
                 data = search_commons(
@@ -608,21 +716,25 @@ def main() -> None:
                     continue_token=gsrcontinue,
                     per_page=per_page,
                     ua=ua,
-                    rate_limiter=rate_limiter,
+                    rate_limiter=search_rate_limiter,
+                    max_retries=search_max_retries,
+                    max_retry_wait_sec=max_retry_wait_sec,
+                    monitor=monitor,
                 )
                 pages = (data.get("query") or {}).get("pages") or {}
                 if not pages:
-                    print(
-                        f"[Wikicommons][{cat}:{kw}][{stage}] page_stats candidates=0 downloaded=0 filter_passed=0 accepted=0")
                     flush_progress()
+                    monitor.maybe_log(cat)
+                    adapt_download_throttle()
                     return 0, None, False
 
                 page_candidates = 0
                 page_downloaded = 0
                 page_filter_passed = 0
                 page_accepted = 0
+                pending: List[Dict[str, Any]] = []
 
-                for _, page in pages.items():
+                for pageid, page in pages.items():
                     if saved >= target:
                         break
 
@@ -634,21 +746,35 @@ def main() -> None:
                     mime = str(imageinfo.get("mime") or "")
                     if not mime.startswith("image/"):
                         continue
-                    page_candidates += 1
 
                     img_url = imageinfo.get("url")
-                    source_page_url = imageinfo.get("descriptionurl") or page.get("fullurl") or ""
-                    if not img_url:
+                    if not img_url or img_url in seen_urls or str(pageid) in seen_pageids:
+                        continue
+
+                    ok_meta, reason = prefilter_imageinfo(imageinfo, filter_cfg)
+                    if not ok_meta:
+                        write_jsonl(retry_log, {
+                            "event": "candidate_prefilter_reject",
+                            "category": cat,
+                            "keyword": kw,
+                            "stage": stage,
+                            "url": img_url,
+                            "result": reason,
+                        })
                         continue
 
                     license_type, license_url = extract_license_fields(imageinfo)
                     if not allow_license(license_type, allowlist):
                         continue
 
+                    source_page_url = imageinfo.get("descriptionurl") or page.get("fullurl") or ""
                     ext = imageinfo.get("extmetadata") or {}
                     author = clean_text((ext.get("Artist") or {}).get("value"))
+                    seen_urls.add(img_url)
+                    seen_pageids.add(str(pageid))
+                    page_candidates += 1
 
-                    candidate = {
+                    pending.append({
                         "img_url": img_url,
                         "source_page_url": source_page_url,
                         "license_type": license_type,
@@ -660,14 +786,18 @@ def main() -> None:
                         "next_retry_ts": 0.0,
                         "accum_wait_sec": 0.0,
                         "last_status_code": None,
-                    }
-                    outcome, downloaded, filter_passed = handle_download_candidate(candidate, from_deferred=False)
-                    if downloaded > 0:
-                        page_downloaded += 1
-                        if filter_passed:
-                            page_filter_passed += 1
-                    if outcome == "accepted":
-                        page_accepted += 1
+                    })
+
+                if pending:
+                    with ThreadPoolExecutor(max_workers=download_workers) as ex:
+                        futures = [ex.submit(handle_download_candidate, cand, False) for cand in pending]
+                        for fut in as_completed(futures):
+                            res = fut.result()
+                            page_downloaded += int(res["downloaded"] > 0)
+                            if res["filter_passed"]:
+                                page_filter_passed += 1
+                            if res["accepted"]:
+                                page_accepted += 1
 
                 deferred_accepted = process_deferred_queue()
                 page_accepted += deferred_accepted
@@ -677,19 +807,15 @@ def main() -> None:
                 cumulative_stats["filter_passed"] += page_filter_passed
                 cumulative_stats["accepted"] += page_accepted
 
+                next_continue = (data.get("continue") or {}).get("gsrcontinue")
                 print(
                     f"[Wikicommons][{cat}:{kw}][{stage}] page_stats "
                     f"candidates={page_candidates} downloaded={page_downloaded} "
                     f"filter_passed={page_filter_passed} accepted={page_accepted} deferred_pending={len(deferred_urls)}"
                 )
-                print(
-                    f"[Wikicommons][{cat}] cumulative_stats "
-                    f"candidates={cumulative_stats['candidates']} downloaded={cumulative_stats['downloaded']} "
-                    f"filter_passed={cumulative_stats['filter_passed']} accepted={cumulative_stats['accepted']}"
-                )
-
-                next_continue = (data.get("continue") or {}).get("gsrcontinue")
                 flush_progress()
+                monitor.maybe_log(cat)
+                adapt_download_throttle()
                 return page_accepted, next_continue, True
 
             with tqdm(total=target, initial=min(saved, target), desc=f"WCM {cat}", unit="img") as pbar:
@@ -717,11 +843,9 @@ def main() -> None:
                             if kw in exhausted_kws:
                                 continue
 
-                            accepted, next_continue, has_pages = process_keyword_page(
-                                kw,
-                                secondary_continue_map.get(kw),
-                                "secondary",
-                            )
+                            accepted, next_continue, has_pages = process_keyword_page(kw,
+                                                                                      secondary_continue_map.get(kw),
+                                                                                      "secondary")
 
                             if accepted > 0:
                                 pbar.update(accepted)
@@ -731,36 +855,23 @@ def main() -> None:
                             else:
                                 secondary_continue_map[kw] = next_continue
 
-                            print(
-                                f"[Wikicommons][{cat}] stage_summary "
-                                f"primary_saved={primary_saved}/{primary_target} "
-                                f"secondary_saved={secondary_saved}/{secondary_target} total_saved={saved}/{target} "
-                                f"deferred_pending={len(deferred_urls)}"
-                            )
                             flush_progress()
 
                     if (
-                            saved < target
-                            and allow_cross_keyword_backfill
-                            and (not stop_when_exhausted or len(exhausted_kws) >= len(secondary_kws))
+                        saved < target
+                        and allow_cross_keyword_backfill
+                        and (not stop_when_exhausted or len(exhausted_kws) >= len(secondary_kws))
                     ):
                         backfill_keywords = [kw for kw in build_backfill_keywords(cat, keywords) if kw not in set(keywords)]
-                        if backfill_keywords:
-                            print(f"[Wikicommons][{cat}] start backfill keywords={backfill_keywords}")
                         for backfill_kw in backfill_keywords:
                             if saved >= target:
                                 break
-                            if stop_when_exhausted and backfill_kw in exhausted_kws:
-                                continue
                             continue_token: Optional[str] = None
                             while saved < target:
-                                accepted, continue_token, has_pages = process_keyword_page(backfill_kw, continue_token,"secondary")
+                                accepted, continue_token, has_pages = process_keyword_page(backfill_kw, continue_token, "secondary")
                                 if accepted > 0:
                                     pbar.update(accepted)
                                 if not has_pages or not continue_token:
-                                    exhausted_kws.add(backfill_kw)
-                                    break
-                                if stop_when_exhausted and continue_token is None:
                                     exhausted_kws.add(backfill_kw)
                                     break
 
