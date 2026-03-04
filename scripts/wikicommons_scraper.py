@@ -823,7 +823,7 @@ def main() -> None:
                 stop_reasons.append(reason)
                 print(f"[Wikicommons][{cat}] early_stop_reason={reason}")
 
-            def process_keyword_page(kw: str, gsrcontinue: Optional[str], stage: str) -> Tuple[int, Optional[str], bool]:
+            def process_keyword_page(kw: str, gsrcontinue: Optional[str], stage: str) -> Tuple[int, Optional[str], bool, str]:
                 data = search_commons(
                     api_url=api_url,
                     keyword=kw,
@@ -838,16 +838,23 @@ def main() -> None:
                 if monitor.requests >= page_429_ratio_min_attempts:
                     page_429_ratio = monitor.r429 / max(monitor.requests, 1)
                     if page_429_ratio >= page_429_ratio_threshold:
+                        pause_sec = min(
+                            max_retry_wait_sec,
+                            max(5.0, download_rate_limiter.min_interval_sec * 10.0),
+                        )
                         log_stop_reason(
-                            f"429_too_high ratio={page_429_ratio:.2%} threshold={page_429_ratio_threshold:.2%}")
-                        return 0, gsrcontinue, False
+                            f"429_too_high ratio={page_429_ratio:.2%} threshold={page_429_ratio_threshold:.2%} "
+                            f"action=temporary_pause sleep={pause_sec:.1f}s keyword={kw}"
+                        )
+                        time.sleep(pause_sec)
+                        return 0, gsrcontinue, True, "paused"
                 pages = (data.get("query") or {}).get("pages") or {}
                 if not pages:
                     flush_progress()
                     monitor.maybe_log(cat)
                     adapt_download_throttle()
                     log_stop_reason(f"keywords_exhausted keyword={kw}")
-                    return 0, None, False
+                    return 0, None, False, "exhausted"
 
                 with state_lock:
                     saved_before_page = saved
@@ -960,13 +967,19 @@ def main() -> None:
                 flush_progress()
                 monitor.maybe_log(cat)
                 adapt_download_throttle()
-                return page_accepted, next_continue, True
+                return page_accepted, next_continue, True, "ok"
 
             with tqdm(total=target, initial=min(saved, target), desc=f"WCM {cat}", unit="img") as pbar:
                 while saved < primary_target:
-                    accepted, primary_continue, has_pages = process_keyword_page(primary_kw, primary_continue, "primary")
+                    accepted, primary_continue, has_pages, page_state = process_keyword_page(
+                        primary_kw,
+                        primary_continue,
+                        "primary",
+                    )
                     if accepted > 0:
                         pbar.update(accepted)
+                    if page_state == "paused":
+                        continue
                     if not has_pages or not primary_continue:
                         break
 
@@ -987,12 +1000,16 @@ def main() -> None:
                             if kw in exhausted_kws:
                                 continue
 
-                            accepted, next_continue, has_pages = process_keyword_page(kw,
-                                                                                      secondary_continue_map.get(kw),
-                                                                                      "secondary")
+                            accepted, next_continue, has_pages, page_state = process_keyword_page(kw,
+                                                                                                  secondary_continue_map.get(
+                                                                                                      kw),
+                                                                                                  "secondary")
 
                             if accepted > 0:
                                 pbar.update(accepted)
+
+                            if page_state == "paused":
+                                continue
 
                             if not has_pages or not next_continue:
                                 exhausted_kws.add(kw)
@@ -1021,10 +1038,15 @@ def main() -> None:
                                         f"limit={backfill_max_pages_per_keyword}"
                                     )
                                     break
-                                accepted, continue_token, has_pages = process_keyword_page(backfill_kw, continue_token, "secondary")
+                                accepted, next_continue, has_pages, page_state = process_keyword_page(kw,
+                                                                                                      secondary_continue_map.get(
+                                                                                                          kw),
+                                                                                                      "secondary")
                                 pages_taken += 1
                                 if accepted > 0:
                                     pbar.update(accepted)
+                                if page_state == "paused":
+                                    continue
                                 if not has_pages or not continue_token:
                                     exhausted_kws.add(backfill_kw)
                                     break
