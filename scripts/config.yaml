@@ -58,8 +58,10 @@ wikicommons:
   per_page: 50
   primary_ratio: 0.7      # 主关键词目标占比；主关键词不足时会自动由辅关键词补齐
   secondary_mode: "round_robin"   # 辅关键词轮询抓取（每轮每个关键词抓一页）
-  stop_when_exhausted: true
-  allow_cross_keyword_backfill: false
+  stop_when_exhausted: false
+  allow_cross_keyword_backfill: true
+  backfill_max_keywords: 6
+  backfill_max_pages_per_keyword: 8
   license_allowlist: ["cc0", "public domain", "cc-by", "cc-by-sa", "pdm"]
 
 openverse:

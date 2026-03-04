@@ -493,6 +493,10 @@ def main() -> None:
     secondary_mode = str(wc_cfg.get("secondary_mode", "round_robin")).strip().lower()
     stop_when_exhausted = bool(wc_cfg.get("stop_when_exhausted", True))
     allow_cross_keyword_backfill = bool(wc_cfg.get("allow_cross_keyword_backfill", False))
+    backfill_max_keywords = max(0, int(wc_cfg.get("backfill_max_keywords", 0)))
+    backfill_max_pages_per_keyword = max(0, int(wc_cfg.get("backfill_max_pages_per_keyword", 0)))
+    page_429_ratio_min_attempts = max(1, int(cfg["download"].get("page_429_ratio_min_attempts", 5)))
+    page_429_ratio_threshold = float(cfg["download"].get("page_429_ratio_threshold", 0.5))
     if cfg["licenses"].get("mode") == "cc0_only":
         allowlist = ["cc0", "public domain", "pdm"]
     else:
@@ -560,7 +564,10 @@ def main() -> None:
                 f"primary_kw={primary_kw} secondary_kws={secondary_kws} "
                 f"primary_target={primary_target} secondary_target={secondary_target} "
                 f"secondary_mode={secondary_mode} stop_when_exhausted={stop_when_exhausted} "
-                f"allow_cross_keyword_backfill={allow_cross_keyword_backfill}"
+                f"allow_cross_keyword_backfill={allow_cross_keyword_backfill} "
+                f"backfill_max_keywords={backfill_max_keywords} "
+                f"backfill_max_pages_per_keyword={backfill_max_pages_per_keyword} "
+                f"page_429_ratio_threshold={page_429_ratio_threshold:.2f}"
             )
             print(f"[Wikicommons][{cat}] restored_deferred_count={len(deferred_urls)}")
 
@@ -808,6 +815,14 @@ def main() -> None:
                 cumulative_stats["filter_passed"] += stats["filter_passed"]
                 cumulative_stats["accepted"] += stats["accepted"]
 
+            stop_reasons: List[str] = []
+
+            def log_stop_reason(reason: str) -> None:
+                if reason in stop_reasons:
+                    return
+                stop_reasons.append(reason)
+                print(f"[Wikicommons][{cat}] early_stop_reason={reason}")
+
             def process_keyword_page(kw: str, gsrcontinue: Optional[str], stage: str) -> Tuple[int, Optional[str], bool]:
                 data = search_commons(
                     api_url=api_url,
@@ -820,11 +835,18 @@ def main() -> None:
                     max_retry_wait_sec=max_retry_wait_sec,
                     monitor=monitor,
                 )
+                if monitor.requests >= page_429_ratio_min_attempts:
+                    page_429_ratio = monitor.r429 / max(monitor.requests, 1)
+                    if page_429_ratio >= page_429_ratio_threshold:
+                        log_stop_reason(
+                            f"429_too_high ratio={page_429_ratio:.2%} threshold={page_429_ratio_threshold:.2%}")
+                        return 0, gsrcontinue, False
                 pages = (data.get("query") or {}).get("pages") or {}
                 if not pages:
                     flush_progress()
                     monitor.maybe_log(cat)
                     adapt_download_throttle()
+                    log_stop_reason(f"keywords_exhausted keyword={kw}")
                     return 0, None, False
 
                 with state_lock:
@@ -912,6 +934,12 @@ def main() -> None:
                 deferred_stats = process_deferred_queue()
                 page_downloaded += deferred_stats["downloaded"]
                 page_filter_passed += deferred_stats["filter_passed"]
+                page_filter_pass_ratio = page_filter_passed / max(page_downloaded, 1)
+                if page_downloaded >= 8 and page_filter_pass_ratio < 0.1:
+                    log_stop_reason(
+                        f"filter_too_strict pass_ratio={page_filter_pass_ratio:.2%} "
+                        f"downloaded={page_downloaded}"
+                    )
 
                 with state_lock:
                     page_accepted = max(0, saved - saved_before_page)
@@ -979,17 +1007,31 @@ def main() -> None:
                         and (not stop_when_exhausted or len(exhausted_kws) >= len(secondary_kws))
                     ):
                         backfill_keywords = [kw for kw in build_backfill_keywords(cat, keywords) if kw not in set(keywords)]
+                        if backfill_max_keywords > 0:
+                            backfill_keywords = backfill_keywords[:backfill_max_keywords]
                         for backfill_kw in backfill_keywords:
                             if saved >= target:
                                 break
                             continue_token: Optional[str] = None
+                            pages_taken = 0
                             while saved < target:
+                                if backfill_max_pages_per_keyword > 0 and pages_taken >= backfill_max_pages_per_keyword:
+                                    log_stop_reason(
+                                        f"backfill_page_cap_reached keyword={backfill_kw} "
+                                        f"limit={backfill_max_pages_per_keyword}"
+                                    )
+                                    break
                                 accepted, continue_token, has_pages = process_keyword_page(backfill_kw, continue_token, "secondary")
+                                pages_taken += 1
                                 if accepted > 0:
                                     pbar.update(accepted)
                                 if not has_pages or not continue_token:
                                     exhausted_kws.add(backfill_kw)
                                     break
+
+                        if saved < target and backfill_max_keywords > 0 and len(
+                                backfill_keywords) >= backfill_max_keywords:
+                            log_stop_reason(f"backfill_keyword_cap_reached limit={backfill_max_keywords}")
 
                 while saved < target and deferred_urls:
                     deferred_stats = process_deferred_queue()
@@ -1004,6 +1046,11 @@ def main() -> None:
                         if sleep_sec <= 0:
                             break
                         time.sleep(sleep_sec)
+
+                if saved >= target:
+                    log_stop_reason(f"target_reached saved={saved} target={target}")
+                elif stop_when_exhausted and saved < target and not deferred_urls:
+                    log_stop_reason("keywords_exhausted")
 
                 for item in deferred_urls:
                     with state_lock:
