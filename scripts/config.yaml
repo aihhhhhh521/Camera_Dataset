@@ -10,19 +10,19 @@ naming:
 download:
   timeout_sec: 30
   max_retries_per_try: 2
-  max_total_attempts_per_url: 3
+  max_total_attempts_per_url: 4
   max_retry_wait_sec: 30
   sleep_sec: 1.0       # 兼容旧字段，等价于 API 默认请求间隔
   api_sleep_sec: 3
-  image_sleep_sec: 2
-  download_workers: 2
+  image_sleep_sec: 3
+  download_workers: 1
   monitor_interval_sec: 60
   user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 CameraPoseDatasetBot/1.0 (+research; CC-only)"
   headers_profile: "browser_like"   # minimal / browser_like
   referer_enabled: true
-  domain_429_threshold: 3
+  domain_429_threshold: 2
   domain_cooldown_min_sec: 300
-  domain_cooldown_max_sec: 900
+  domain_cooldown_max_sec: 600
   url_429_blacklist_threshold: 2
   page_429_ratio_min_attempts: 5
   page_429_ratio_threshold: 0.5
@@ -34,15 +34,15 @@ licenses:
   # Flickr 侧我们会动态拉取 license_id 映射，再按“是否 ND”过滤，cc0_only 会只保留 Public Domain/CC0
 
 categories:
-#  portraits:
-#    keywords: ["Portrait photography", "Lifestyle photography", "Head shots", "Featured historical portrait photographs"]
-#    target_count: 1000
-#  animals_plants:
-#    keywords: ["Wildlife", "Flowers", "Plants", "Birds in flight"]
-#    target_count: 1000
-#  natural_landscapes:
-#    keywords: ["Landscapes", "Mountains", "Seascapes", "Featured pictures of landscapes"]
-#    target_count: 1000
+  portraits:
+    keywords: ["Portrait photography", "Lifestyle photography", "Head shots", "Featured historical portrait photographs"]
+    target_count: 1000
+  animals_plants:
+    keywords: ["Wildlife", "Flowers", "Plants", "Birds in flight"]
+    target_count: 1000
+  natural_landscapes:
+    keywords: ["Landscapes", "Mountains", "Seascapes", "Featured pictures of landscapes"]
+    target_count: 1000
   urban_architecture:
     keywords: ["Architectural photography", "Cityscapes", "Street photography", "Buildings"]
     target_count: 1000
@@ -82,7 +82,7 @@ flickr:
 
 pipeline_filter:
   enabled: true
-  min_side: 1024
+  min_side: 512
   max_aspect_ratio: 3.0
   min_filesize_kb: 40
   max_pixels: 89478485

@@ -36,11 +36,22 @@ class RetryableHTTPError(RuntimeError):
 
 
 class RateLimiter:
-    def __init__(self, min_interval_sec: float) -> None:
+    def __init__(
+            self,
+            min_interval_sec: float,
+            *,
+            domain_429_threshold: int = 3,
+            domain_cooldown_min_sec: float = 300.0,
+            domain_cooldown_max_sec: float = 900.0,
+    ) -> None:
         self.min_interval_sec = max(0.0, float(min_interval_sec))
+        self.domain_429_threshold = max(1, int(domain_429_threshold))
+        self.domain_cooldown_min_sec = max(1.0, float(domain_cooldown_min_sec))
+        self.domain_cooldown_max_sec = max(self.domain_cooldown_min_sec, float(domain_cooldown_max_sec))
         self._last_global = 0.0
         self._last_by_domain: Dict[str, float] = {}
         self._blocked_until_by_domain: Dict[str, float] = {}
+        self._consecutive_429_by_domain: Dict[str, int] = {}
         self._lock = threading.Lock()
 
     def update_min_interval(self, min_interval_sec: float) -> None:
@@ -57,6 +68,33 @@ class RateLimiter:
         deadline = time.monotonic() + wait_sec
         with self._lock:
             self._blocked_until_by_domain[host] = max(self._blocked_until_by_domain.get(host, 0.0), deadline)
+
+    def observe_status(self, url: str, status_code: int, retry_after_sec: Optional[float]) -> float:
+        host = self._host_from_url(url)
+        now = time.monotonic()
+        applied_cooldown = 0.0
+
+        with self._lock:
+            if status_code == 429:
+                count = self._consecutive_429_by_domain.get(host, 0) + 1
+                self._consecutive_429_by_domain[host] = count
+                if count >= self.domain_429_threshold:
+                    burst_factor = 2 ** min(4, count - self.domain_429_threshold)
+                    cooldown = min(
+                        self.domain_cooldown_max_sec,
+                        self.domain_cooldown_min_sec * burst_factor,
+                    )
+                    if retry_after_sec is not None:
+                        cooldown = max(cooldown, retry_after_sec)
+                    applied_cooldown = max(0.0, cooldown)
+                    blocked_until = now + applied_cooldown
+                    self._blocked_until_by_domain[host] = max(self._blocked_until_by_domain.get(host, 0.0),
+                                                              blocked_until)
+                    self.min_interval_sec = min(10.0, max(self.min_interval_sec * 1.2, self.min_interval_sec + 0.1))
+            elif status_code < 500:
+                self._consecutive_429_by_domain[host] = 0
+
+        return applied_cooldown
 
     def wait(self, url: str) -> None:
         host = self._host_from_url(url)
@@ -266,6 +304,11 @@ def request_with_retry(
                 )
                 jitter_sec = min(2.0, wait_sec * 0.25) * random.random()
                 effective_wait = wait_sec + jitter_sec
+                domain_cooldown_sec = 0.0
+                if rate_limiter:
+                    domain_cooldown_sec = rate_limiter.observe_status(url, r.status_code, retry_after_sec)
+                if domain_cooldown_sec > effective_wait:
+                    effective_wait = domain_cooldown_sec
                 print(f"[Wikicommons] retry status={r.status_code} wait={effective_wait:.2f}s url={url}")
                 if rate_limiter:
                     rate_limiter.penalize(url, effective_wait)
@@ -273,6 +316,8 @@ def request_with_retry(
                     time.sleep(effective_wait)
                 last_err = RetryableHTTPError(url=url, status_code=r.status_code, retry_after_sec=retry_after_sec)
                 continue
+            if rate_limiter:
+                rate_limiter.observe_status(url, r.status_code, retry_after_sec=None)
             r.raise_for_status()
             return r
         except Exception as e:
@@ -475,6 +520,22 @@ def main() -> None:
     download_sleep_sec = float(cfg["download"].get("image_sleep_sec", cfg["download"].get("sleep_sec", 1.0)))
     search_rate_limiter = RateLimiter(search_sleep_sec)
     download_rate_limiter = RateLimiter(download_sleep_sec)
+
+    domain_429_threshold = int(cfg["download"].get("domain_429_threshold", 3))
+    domain_cooldown_min_sec = float(cfg["download"].get("domain_cooldown_min_sec", 300))
+    domain_cooldown_max_sec = float(cfg["download"].get("domain_cooldown_max_sec", 900))
+    search_rate_limiter = RateLimiter(
+        search_sleep_sec,
+        domain_429_threshold=domain_429_threshold,
+        domain_cooldown_min_sec=domain_cooldown_min_sec,
+        domain_cooldown_max_sec=domain_cooldown_max_sec,
+    )
+    download_rate_limiter = RateLimiter(
+        download_sleep_sec,
+        domain_429_threshold=domain_429_threshold,
+        domain_cooldown_min_sec=domain_cooldown_min_sec,
+        domain_cooldown_max_sec=domain_cooldown_max_sec,
+    )
 
     download_workers = max(1, int(cfg["download"].get("download_workers", 4)))
     monitor_interval_sec = float(cfg["download"].get("monitor_interval_sec", 60))
@@ -824,17 +885,33 @@ def main() -> None:
                 print(f"[Wikicommons][{cat}] early_stop_reason={reason}")
 
             def process_keyword_page(kw: str, gsrcontinue: Optional[str], stage: str) -> Tuple[int, Optional[str], bool, str]:
-                data = search_commons(
-                    api_url=api_url,
-                    keyword=kw,
-                    continue_token=gsrcontinue,
-                    per_page=per_page,
-                    ua=ua,
-                    rate_limiter=search_rate_limiter,
-                    max_retries=search_max_retries,
-                    max_retry_wait_sec=max_retry_wait_sec,
-                    monitor=monitor,
-                )
+                try:
+                    data = search_commons(
+                        api_url=api_url,
+                        keyword=kw,
+                        continue_token=gsrcontinue,
+                        per_page=per_page,
+                        ua=ua,
+                        rate_limiter=search_rate_limiter,
+                        max_retries=search_max_retries,
+                        max_retry_wait_sec=max_retry_wait_sec,
+                        monitor=monitor,
+                    )
+                except RetryableHTTPError as e:
+                    pause_sec = compute_retry_wait(
+                        retry_idx=max(0, search_max_retries - 1),
+                        min_interval_sec=search_rate_limiter.min_interval_sec,
+                        retry_after_sec=e.retry_after_sec,
+                        max_wait_sec=max_retry_wait_sec,
+                    )
+                    if search_rate_limiter:
+                        search_rate_limiter.penalize(api_url, pause_sec)
+                    log_stop_reason(
+                        f"search_retryable_error status={e.status_code} keyword={kw} "
+                        f"action=temporary_pause sleep={pause_sec:.1f}s"
+                    )
+                    time.sleep(pause_sec)
+                    return 0, gsrcontinue, True, "paused"
                 if monitor.requests >= page_429_ratio_min_attempts:
                     page_429_ratio = monitor.r429 / max(monitor.requests, 1)
                     if page_429_ratio >= page_429_ratio_threshold:
