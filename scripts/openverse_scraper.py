@@ -346,6 +346,9 @@ def main():
     init_db(dataset_root)
 
     ua = cfg["download"]["user_agent"]
+    max_retries_per_try = int(cfg["download"].get("max_retries_per_try", cfg["download"].get("max_retries", 2)))
+    search_sleep_sec = float(cfg["download"].get("api_sleep_sec", cfg["download"].get("sleep_sec", 1.0)))
+    download_sleep_sec = float(cfg["download"].get("image_sleep_sec", cfg["download"].get("sleep_sec", 1.0)))
     pf = PipelineFilter(cfg["pipeline_filter"])
 
     prefixes = cfg["naming"]["prefixes"]
@@ -381,6 +384,7 @@ def main():
 
             with tqdm(total=target, initial=saved, desc=f"OV {cat}:{kw}", unit="img") as pbar:
                 while saved < target:
+                    time.sleep(search_sleep_sec)
                     data, token = ov_search_with_retry(
                         base_url=base_url,
                         q=kw,
@@ -406,13 +410,13 @@ def main():
                             continue
 
                         # 下载
-                        time.sleep(cfg["download"]["sleep_sec"])
+                        time.sleep(download_sleep_sec)
                         try:
                             b = download(
                                 img_url,
                                 ua=ua,
                                 timeout=int(cfg["download"]["timeout_sec"]),
-                                max_retries=int(cfg["download"]["max_retries"]),
+                                max_retries=max_retries_per_try,
                             )
                         except Exception:
                             continue

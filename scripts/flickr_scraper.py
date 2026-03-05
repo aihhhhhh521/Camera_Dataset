@@ -358,6 +358,9 @@ def main():
     init_db(dataset_root)
 
     ua = cfg["download"]["user_agent"]
+    max_retries_per_try = int(cfg["download"].get("max_retries_per_try", cfg["download"].get("max_retries", 2)))
+    search_sleep_sec = float(cfg["download"].get("api_sleep_sec", cfg["download"].get("sleep_sec", 1.0)))
+    download_sleep_sec = float(cfg["download"].get("image_sleep_sec", cfg["download"].get("sleep_sec", 1.0)))
     headers_profile = cfg["download"].get("headers_profile", "browser_like")
     referer_enabled = bool(cfg["download"].get("referer_enabled", True))
     pf = PipelineFilter(cfg["pipeline_filter"])
@@ -414,6 +417,7 @@ def main():
                             "tags",
                         ]),
                     }
+                    time.sleep(search_sleep_sec)
                     data = flickr_call(api_key, "flickr.photos.search", params, ua)
                     photos = data["photos"]["photo"]
                     if not photos:
@@ -447,7 +451,7 @@ def main():
                         photo_page = f"https://www.flickr.com/photos/{owner}/{photo_id}/"
                         if not url:
                             # 兜底：getSizes 再查一次最大图
-                            base = float(cfg["download"]["sleep_sec"])
+                            base = download_sleep_sec
                             time.sleep(base + random.uniform(0, base * 0.5))
                             try:
                                 url = get_sizes_best(api_key, photo_id, ua)
@@ -500,7 +504,7 @@ def main():
                             )
                             continue
 
-                        base = float(cfg["download"]["sleep_sec"])
+                        base = download_sleep_sec
                         time.sleep(base + random.uniform(0, base * 0.5))
                         b = None
                         page_download_attempts += 1
@@ -514,7 +518,7 @@ def main():
                                     referer_enabled=referer_enabled,
                                 ),
                                 timeout=int(cfg["download"]["timeout_sec"]),
-                                max_retries=int(cfg["download"]["max_retries"]),
+                                max_retries=max_retries_per_try,
                                 domain_429_threshold=int(cfg["download"].get("domain_429_threshold", 3)),
                                 domain_cooldown_sec_range=(
                                     float(cfg["download"].get("domain_cooldown_min_sec", 300)),
@@ -534,7 +538,7 @@ def main():
                                 error_type=_error_type(e),
                                 message=str(e),
                                 retry_after=_retry_after_from_exc(e),
-                                attempt=int(cfg["download"]["max_retries"]),
+                                attempt=max_retries_per_try,
                                 headers_profile=headers_profile,
                                 log_path=fail_log_path,
                             )
@@ -550,7 +554,7 @@ def main():
                                 error_type=_error_type(e),
                                 message=str(e),
                                 retry_after=_retry_after_from_exc(e),
-                                attempt=int(cfg["download"]["max_retries"]),
+                                attempt=max_retries_per_try,
                                 headers_profile=headers_profile,
                                 log_path=fail_log_path,
                             )
@@ -568,7 +572,7 @@ def main():
                                 error_type=_error_type(e),
                                 message=str(e),
                                 retry_after=_retry_after_from_exc(e),
-                                attempt=_attempt_from_message(str(e)) or int(cfg["download"]["max_retries"]),
+                                attempt=_attempt_from_message(str(e)) or max_retries_per_try,
                                 headers_profile=headers_profile,
                                 log_path=fail_log_path,
                             )
