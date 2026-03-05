@@ -34,9 +34,9 @@ licenses:
   # Flickr 侧我们会动态拉取 license_id 映射，再按“是否 ND”过滤，cc0_only 会只保留 Public Domain/CC0
 
 categories:
-  portraits:
-    keywords: ["Portrait photography", "Lifestyle photography", "Head shots", "Featured historical portrait photographs"]
-    target_count: 1000
+#  portraits:
+#    keywords: ["Portrait photography", "Lifestyle photography", "Head shots", "Featured historical portrait photographs"]
+#    target_count: 1000
   animals_plants:
     keywords: ["Wildlife", "Flowers", "Plants", "Birds in flight"]
     target_count: 1000

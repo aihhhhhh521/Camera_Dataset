@@ -1115,18 +1115,20 @@ def main() -> None:
                                         f"limit={backfill_max_pages_per_keyword}"
                                     )
                                     break
-                                accepted, next_continue, has_pages, page_state = process_keyword_page(kw,
-                                                                                                      secondary_continue_map.get(
-                                                                                                          kw),
-                                                                                                      "secondary")
+                                accepted, next_continue, has_pages, page_state = process_keyword_page(
+                                    backfill_kw,
+                                    continue_token,
+                                    "secondary",
+                                )
                                 pages_taken += 1
                                 if accepted > 0:
                                     pbar.update(accepted)
                                 if page_state == "paused":
                                     continue
-                                if not has_pages or not continue_token:
+                                if not has_pages or not next_continue:
                                     exhausted_kws.add(backfill_kw)
                                     break
+                                continue_token = next_continue
 
                         if saved < target and backfill_max_keywords > 0 and len(
                                 backfill_keywords) >= backfill_max_keywords:
@@ -1140,6 +1142,8 @@ def main() -> None:
                         pbar.update(accepted)
                         flush_progress()
                     if accepted == 0:
+                        if not deferred_urls:
+                            break
                         next_retry_ts = min(item.get("next_retry_ts", time.time()) for item in deferred_urls)
                         sleep_sec = max(0.0, min(max_retry_wait_sec, next_retry_ts - time.time()))
                         if sleep_sec <= 0:
