@@ -299,13 +299,13 @@ def ov_search_with_retry(
 
 
 def download(url: str, ua: str, timeout: int, max_retries: int) -> bytes:
-    last_err = None
+    last_err: Optional[Exception] = None
     for _ in range(max_retries):
         try:
             r = requests.get(url, headers={"User-Agent": ua}, timeout=timeout)
             r.raise_for_status()
             return r.content
-        except Exception as e:
+        except requests.RequestException as e:
             last_err = e
             time.sleep(0.5)
     raise RuntimeError(f"download failed: {url} err={last_err}")
@@ -426,7 +426,10 @@ def main():
                             continue
 
                         # pipeline filter
-                        ok, metrics, reason = pf.validate(b)
+                        try:
+                            ok, metrics, reason = pf.validate(b)
+                        except Exception:
+                            continue
                         if not ok:
                             continue
 

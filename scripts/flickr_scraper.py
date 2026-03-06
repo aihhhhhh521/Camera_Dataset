@@ -196,7 +196,7 @@ def choose_allowed_license_ids(license_map: Dict[str, dict], mode: str) -> List[
 
 def best_download_url(photo: dict) -> Optional[str]:
     # extras 里如果有 url_o（原图）就用，否则降级
-    for k in ["url_b", "url_c", "url_l", "url_o", "url_z"]:
+    for k in ["url_o", "url_l", "url_b", "url_c", "url_z"]:
         if k in photo:
             return photo[k]
     return None
